@@ -1,0 +1,108 @@
+{
+  "server": {
+    "bind": "127.0.0.1",
+    "guiPort": 3000,
+    "apiPort": 3001,
+    "maxConcurrentSubagents": 20,
+    "maxSubagentIdleMs": 120000
+  },
+  "primary": {
+    "name": "primary",
+    "model": "YOUR_PRIMARY_MODEL",
+    "thinking": "median",
+    "skills": [
+      "*"
+    ],
+    "systemPrompt": "You are a primary orchestrator. Delegate tasks to subagents, avoiding wasting context window on detail and keeping the whole-project view.",
+    "agent_allowlist": [
+      "tester",
+      "coder",
+      "reviewer"
+    ],
+    "tools": [
+      "read",
+      "grep",
+      "find"
+    ],
+    "mcp": []
+  },
+  "agents": [
+    {
+      "name": "tester",
+      "model": "YOUR_WORKER_MODEL",
+      "thinking": "median",
+      "max_concurrency": 1,
+      "tools": [
+        "read",
+        "edit",
+        "write",
+        "bash",
+        "grep",
+        "find"
+      ],
+      "skills": [
+        "*"
+      ],
+      "cwd": null,
+      "systemPrompt": "You are the TEST/RESEARCH subagent. Execute tests, gather findings, and report results to the parent agent.",
+      "agent_allowlist": [],
+      "mcp": []
+    },
+    {
+      "name": "coder",
+      "model": "YOUR_WORKER_MODEL",
+      "thinking": "median",
+      "max_concurrency": 1,
+      "tools": [
+        "read",
+        "edit",
+        "write",
+        "bash",
+        "grep",
+        "find"
+      ],
+      "skills": [
+        "*"
+      ],
+      "cwd": null,
+      "systemPrompt": "You are the CODING subagent. Implement changes and report results to the parent agent.",
+      "agent_allowlist": [],
+      "mcp": []
+    },
+    {
+      "name": "reviewer",
+      "model": "YOUR_WORKER_MODEL",
+      "thinking": "median",
+      "max_concurrency": 1,
+      "tools": [
+        "read",
+        "grep",
+        "find",
+        "bash"
+      ],
+      "skills": [
+        "*"
+      ],
+      "cwd": null,
+      "systemPrompt": "You are the REVIEW subagent. Suited for code review and review of visual artifacts (screenshots, UI). Review and report findings to the parent agent; do not modify code.",
+      "agent_allowlist": [],
+      "mcp": []
+    }
+  ],
+  "llm": [
+    {
+      "name": "YOUR_PRIMARY_MODEL",
+      "context_window": 200000,
+      "prices": "describe your pricing / quota model",
+      "capability": "describe capabilities (e.g. coding ability, vision)",
+      "speed": "describe typical tokens/sec"
+    },
+    {
+      "name": "YOUR_WORKER_MODEL",
+      "context_window": 128000,
+      "prices": "describe your pricing / quota model",
+      "capability": "describe capabilities (e.g. coding ability, vision)",
+      "speed": "describe typical tokens/sec"
+    }
+  ]
+}

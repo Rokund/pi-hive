@@ -1,0 +1,342 @@
+"""Reference Python client for driving a pi-hive over its WebSocket API.
+
+This is the SKILL-reference client: it implements exactly what an AI agent
+driving the hive by WebSocket needs, and nothing else. The hive is assumed to
+already be running; this code does NOT start, configure, or query it over HTTP.
+
+It speaks only the WebSocket protocol documented in SKILL.md:
+  * commands  -> {"type": prompt|steer|follow_up|abort|get_tree|get_agent|subscribe}
+  * responses -> {"type":"response", "command":..., "success":...}
+  * output    -> {"type":"hive:event", "agentId":..., "event":{...}} (streams)
+
+Only one third-party dependency: `websocket-client` (pip install websocket-client),
+plus Python's stdlib for everything else. No `requests`, no external constants.
+
+The `subagent_*` tools (spawn/result/abort/steer/followup/glimpse) are HTTP
+endpoints that the PRIMARY calls via its extension — a WS-only driver normally
+never touches them. The one exception documented here is `subagent_glimpse`
+(peek at a subagent's live output): it has NO WS command, only the HTTP endpoint
+`POST /hive/subagent/glimpse`, so the optional helper `HiveClient.subagent_glimpse()`
+below uses stdlib `urllib` to mirror the extension's exact call shape. It is
+purely optional — driving primaries over WS never needs it.
+
+Deltas vs final: `message_update` frames are streamed deltas; the authoritative
+final text of a turn is the assistant `message_end`. Completion is signaled by
+the `agent_settled` event (authoritative) or a node status of idle (primary) /
+done (subagent). Never treat `message_update` as a final answer.
+"""
+from __future__ import annotations
+
+import json
+import time
+from typing import Any, Optional
+
+import websocket  # websocket-client  (pip install websocket-client)
+
+
+class HiveError(Exception):
+    """Raised for protocol / connection / timeout failures."""
+
+
+class HiveClient:
+    """Thin, WS-only driver for one hive. Thread-safety not guaranteed."""
+
+    def __init__(self, ws_url: str = "ws://127.0.0.1:3001/ws", recv_timeout: float = 10.0):
+        self.ws_url = ws_url
+        self.recv_timeout = recv_timeout
+
+    # ------------------------------------------------------------------ liveness
+    def check_online(self) -> bool:
+        """Best-effort liveness: opening a WebSocket is the online check."""
+        ws = None
+        try:
+            ws = websocket.create_connection(self.ws_url, timeout=self.recv_timeout)
+            return True
+        except Exception:
+            return False
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------- WS primitives
+    def _connect(self) -> websocket.WebSocket:
+        return websocket.create_connection(self.ws_url, timeout=self.recv_timeout)
+
+    @staticmethod
+    def _send(ws: websocket.WebSocket, payload: dict) -> None:
+        ws.send(json.dumps(payload, ensure_ascii=False))
+
+    @staticmethod
+    def _next_frame(ws: websocket.WebSocket):
+        """Read one JSON frame; returns parsed dict or None on timeout/close."""
+        try:
+            raw = ws.recv()
+        except websocket.WebSocketTimeoutException:
+            return None
+        except (websocket.WebSocketConnectionClosedException, ConnectionError):
+            return None
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    # -------------------------------------------------------------------- tree
+    def get_tree(self, idle_grace: float = 5.0) -> list[dict]:
+        """Return the current node tree (send get_tree, read its response)."""
+        ws = self._connect()
+        try:
+            self._send(ws, {"type": "get_tree"})
+            deadline = time.time() + idle_grace
+            while time.time() < deadline:
+                frame = self._next_frame(ws)
+                if frame and frame.get("type") == "response" and frame.get("command") == "get_tree":
+                    return (frame.get("data") or {}).get("tree", [])
+            raise HiveError("get_tree: no response within idle_grace")
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _primary_ids(self) -> set[str]:
+        try:
+            return {n["id"] for n in self.get_tree() if n.get("kind") == "primary"}
+        except Exception:
+            return set()
+
+    # ------------------------------------------------------------------- drive
+    def drive(
+        self,
+        prompt: str,
+        agent_id: Optional[str] = None,
+        cwd: Optional[str] = None,
+        wall_timeout: float = 1800.0,
+        collect: Optional[list] = None,
+    ) -> dict:
+        """Send a prompt and stream until the agent settles.
+
+        * `agent_id` omitted -> starts a NEW primary conversation (bare prompt)
+          and discovers its id from the event stream.
+        * `agent_id` given   -> continues that conversation (prompt/steer).
+        * `cwd`              -> working directory for a newly spawned primary
+          (ignored by a targeted prompt; cwd is fixed at spawn).
+        * `collect`          -> optional list every raw frame is appended to
+          (for external audit trails).
+
+        Returns a summary dict:
+          {agent_id, settled, status, final_text (last assistant answer),
+           transcript [all assistant texts], tool_calls (deduped), frame_count,
+           duration_s}
+        Note: `settled` is the authoritative completion signal (backed by the
+        agent's `agent_settled` / done status). `status` is the LAST node
+        snapshot we happened to observe and may lag behind the settled signal
+        (e.g. still "running" right before an `agent_settled`), so gate on
+        `settled`, not `status`.
+        """
+        if not self.check_online():
+            raise HiveError("pi-hive not reachable at " + self.ws_url)
+
+        pre = self._primary_ids()
+        target: Optional[str] = agent_id
+        final_texts: list[str] = []
+        tool_calls: list[dict] = []
+        seen_tool_keys: set = set()
+        observed: dict[str, dict] = {}
+        settled_ids: set[str] = set()
+        frames: list = []
+
+        ws = self._connect()
+        start = time.time()
+        settled = False
+        try:
+            payload: dict = {"type": "prompt", "text": prompt}
+            if target:
+                payload["agentId"] = target
+            if cwd:
+                payload["cwd"] = cwd
+            self._send(ws, payload)
+
+            while time.time() - start < wall_timeout:
+                frame = self._next_frame(ws)
+                if frame is None:
+                    continue
+                frames.append(frame)
+                if collect is not None:
+                    collect.append(frame)
+
+                self._observe(frame, target, pre,
+                              observed, settled_ids, final_texts, tool_calls, seen_tool_keys)
+                # Discover the freshly spawned primary if we asked for a new one.
+                if target is None:
+                    target = self._discover_new_primary(frame, pre, target)
+                # Completion: authoritative settled signal, or done node status.
+                if target and (target in settled_ids or self._is_done(observed.get(target))):
+                    settled = True
+                    break
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        return {
+            "agent_id": target,
+            "settled": settled,
+            "status": (observed.get(target) or {}).get("status"),
+            "final_text": final_texts[-1] if final_texts else "",
+            "transcript": final_texts,
+            "tool_calls": tool_calls,
+            "frame_count": len(frames),
+            "duration_s": round(time.time() - start, 1),
+        }
+
+    # ------------------------------------------------------------- frame intake
+    @staticmethod
+    def _snapshot(node: dict) -> dict:
+        st = node.get("status")
+        done = st in ("idle", "done")
+        last = node.get("lastResult") or {}
+        return {"status": st, "done": done,
+                "final_text": (last.get("finalText") or last.get("final_text") or "")}
+
+    @staticmethod
+    def _is_done(snap: Optional[dict]) -> bool:
+        return bool(snap and snap.get("done"))
+
+    @staticmethod
+    def _discover_new_primary(frame: dict, pre: set, current: Optional[str]) -> Optional[str]:
+        """Find a primary id that did not exist before we sent the bare prompt.
+
+        The new root appears in a `hive:agent_updated` or `hive:tree` frame after
+        the bare prompt is accepted. Only ids we had NOT seen before the send
+        qualify, so we never grab a pre-existing conversation.
+        """
+        candidates: list[str] = []
+        if frame.get("type") == "hive:agent_updated":
+            ag = frame.get("agent") or {}
+            if ag.get("kind") == "primary" and ag.get("id"):
+                candidates.append(ag["id"])
+        if frame.get("type") == "hive:tree":
+            for n in frame.get("tree") or []:
+                if n.get("kind") == "primary" and n.get("id"):
+                    candidates.append(n["id"])
+        for cid in candidates:
+            if cid not in pre and cid != current:
+                return cid
+        return None
+
+    def _observe(self, frame, target, pre, observed, settled_ids, final_texts,
+                 tool_calls, seen_tool_keys):
+        t = frame.get("type")
+        if t == "hive:agent_updated":
+            ag = frame.get("agent") or {}
+            if ag.get("id"):
+                observed[ag["id"]] = self._snapshot(ag)
+            return
+        if t != "hive:event":
+            return
+        ev = frame.get("event") or {}
+        aid = frame.get("agentId")
+        etype = ev.get("type")
+        if etype == "agent_settled" and aid:
+            settled_ids.add(aid)
+            return
+        if etype == "message_end":
+            # A subscriber socket carries events for EVERY agent. Only collect
+            # the assistant's text when it belongs to our target, so other
+            # conversations and subagents don't leak into our result.
+            if aid and aid == target:
+                msg = ev.get("message")
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    for b in self._block_texts(msg):
+                        final_texts.append(b)
+            return
+        # Record each tool call exactly once (end frame), keyed by its id.
+        if etype == "tool_execution_end" and aid and aid == target:
+            key = (aid, ev.get("toolCallId") or ev.get("id") or f"{aid}:{ev.get('name')}:{time.time()}")
+            if key not in seen_tool_keys:
+                seen_tool_keys.add(key)
+                tool_calls.append({"agentId": aid, "name": ev.get("name")})
+
+    @staticmethod
+    def _block_texts(message: Optional[dict]) -> list[str]:
+        """Extract text from a message.content[] list (the final-answer shape)."""
+        if not isinstance(message, dict):
+            return []
+        content = message.get("content")
+        out: list[str] = []
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
+                    out.append(str(c["text"]))
+        elif isinstance(content, str) and content.strip():
+            out.append(content)
+        return out
+
+    # ------------------------------------------- optional HTTP peek (glimpse) --
+    # The subagent tool endpoints are HTTP and normally called only by the
+    # PRIMARY through its extension. There is no WS command for a peek, so this
+    # optional helper mirrors the extension's exact POST to /hive/subagent/glimpse
+    # using stdlib urllib (no third-party dependency). Driving primaries over WS
+    # never needs it.
+    def subagent_glimpse(
+        self,
+        agent_id: str,
+        n: int = 1024,
+        api_base: str = "http://127.0.0.1:3001",
+    ) -> dict:
+        """Peek at the tail of a subagent's live produced text (HTTP-only).
+
+        Returns the hive payload: ``{ok, status, phase, complete, truncated,
+        totalChars, text}`` (on transport/HTTP failure, ``{ok: False, error}``).
+        * ``complete: False`` -> the text is a LIVE fragment (thinking or
+          in-flight tool-call arguments), not a final answer.
+        * ``n`` is clamped server-side to [1, 1024]; the server trims ``text``
+          to the last ``n`` characters.
+        * Works for any node id; a known-but-never-streamed node returns an
+          empty text with a ``note``.
+        """
+        import urllib.request  # stdlib
+
+        url = f"{api_base}/hive/subagent/glimpse"
+        body = {"id": agent_id, "n": int(n)}
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.recv_timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:  # HTTPError / URLError / JSONDecodeError
+            return {"ok": False, "error": f"subagent_glimpse failed: {exc}"}
+
+
+def demo() -> None:
+    """Minimal usage: drive a fresh primary in a target directory."""
+    client = HiveClient()
+    result = client.drive(
+        prompt="Reply with exactly one short sentence about the Eiffel Tower.",
+        # cwd is OPTIONAL. Omit it to let the hive's own startup default apply
+        # (the daemon was launched with --cwd <dir> or PI_HIVE_CWD). Passing a
+        # path here only takes effect when it spawns a brand-new primary, so
+        # this client intentionally stays location-independent (no hardcoded
+        # absolute path).
+        cwd=None,
+        wall_timeout=120.0,
+    )
+    print("agent_id:", result["agent_id"])
+    print("settled:", result["settled"])
+    print("status:", result["status"])
+    print("final_text:", result["final_text"])
+    print("tool_calls:", result["tool_calls"])
+
+
+if __name__ == "__main__":
+    demo()

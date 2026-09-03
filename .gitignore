@@ -1,0 +1,45 @@
+# ---- Python (hive orchestrator) ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# ---- Node / Vite + React GUI (hive/gui) ----
+node_modules/
+dist/
+build/
+.vite/
+*.local
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# ---- Runtime state (generated; machine-local paths / session refs — not committed) ----
+hive/state/
+build_loop_state.json
+*.log
+hive_run.log
+*.tmp
+
+# ---- Obsidian local workspace state (personal UI state — not shared) ----
+.obsidian/
+
+# ---- OS / IDE ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.playwright-mcp/
+
+# ---- Local private config (environment-specific values; not committed, use hive.config.json.example) ----
+hive/hive.config.json
+
+# ---- Local copies / scratch (not committed) ----
+pi/
+.agent_work/
