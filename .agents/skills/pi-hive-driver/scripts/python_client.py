@@ -298,6 +298,14 @@ class HiveClient:
           in-flight tool-call arguments), not a final answer.
         * ``n`` is clamped server-side to [1, 1024]; the server trims ``text``
           to the last ``n`` characters.
+        * ``complete`` is the authoritative is-this-done signal — rely on it.
+          ``status`` is only a hint and can lag the live state.
+        * ``truncated: True`` only means the 8KB tail window exceeds ``n``; it
+          does NOT mean the answer is cut off. For the full text, use the WS
+          ``message_end`` event or ``subagent_result``'s ``result.finalText``.
+        * ``totalChars`` is a monotonic per-process counter (== the
+          subagent_result ``progress.liveOutputChars``), not the length of the
+          returned text.
         * Works for any node id; a known-but-never-streamed node returns an
           empty text with a ``note``.
         """

@@ -634,6 +634,10 @@ class _AgentState:
         # Monotonic count of chars streamed via the live tail. A moving number:
         # flat while the model is silent, growing while it emits. Feeds
         # subagent_result.progress to counter the "stalled" misread.
+        # NOTE: intentionally NEVER reset at message_end — it is a per-process
+        # liveness counter, not "chars in the current answer". (The bounded
+        # liveText above IS replaced wholesale on message_end; these two are
+        # deliberately different.)
         self.liveOutputChars: int = 0
         # Provider-reported usage forwarded on message_update, kept current
         # rather than only at completion.
@@ -1259,6 +1263,24 @@ class ProcessManager:
         caller can tell a live fragment from a final answer.
 
         N is clamped to [1, 1024] (the parent-visible "1K" cap).
+
+        Caller contract (read before interpreting the payload):
+          * `complete` is the AUTHORITATIVE "is this a final answer?" signal.
+            Rely on it; it is derived from streaming state + node status.
+          * `status` is a REFERENCE label only — primaries settle to "idle" while
+            subagents settle to "done", and it is maintained by a separate
+            (async) graph path, so it can momentarily disagree with the in-memory
+            state. Do NOT treat `status` alone as a completeness check.
+          * `totalChars` is a MONOTONIC per-process counter of every character
+            streamed since the process started (identical to
+            `subagent_result.progress.liveOutputChars`). It is intentionally NOT
+            reset at message_end, so it can exceed the 8K tail and exceed `n`.
+          * `truncated` only means "the 8K tail is longer than the requested
+            n" — it describes the PEEK WINDOW, not that the answer is cut off.
+            A `complete: true` + `truncated: true` pair is normal and means
+            "settled, but I'm showing only the last n chars". For the FULL
+            final text, use the WS `message_end` event or
+            `subagent_result`'s `result.finalText`, NOT glimpse.
         """
         # Strict clamp to [1, 1024]: an explicit 0/negative is not "default", it
         # is a boundary the contract says to clamp (0 -> 1). Only an absent value

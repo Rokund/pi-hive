@@ -114,7 +114,20 @@ out-of-band can use the stdlib-HTTP helper `HiveClient.subagent_glimpse()` in
 `scripts/python_client.py` (urllib — no new dependency; it still POSTs to the
 legacy `/hive/subagent/glimpse` alias, which remains). The response carries
 `status`, `phase`, `complete`, `truncated`, `totalChars`, `text`; treat
-`complete:false` as a *live fragment*, never a final answer.
+`complete:false` as a *live fragment*, never a final answer. Also note:
+- `complete` is the authoritative "is this a final answer?" signal; rely on it.
+  `status` is a reference label only — primaries settle to `idle` while
+  subagents settle to `done`, and it can briefly disagree with the live state
+  (e.g. at the moment of an abort), so do not use `status` alone to judge
+  completeness.
+- `totalChars` is a monotonic per-process counter of everything streamed since
+  the process started (the same number as `subagent_result`'s progress
+  `liveOutputChars`); it is NOT the length of the returned `text` and is never
+  reset between turns.
+- `truncated:true` only means the 8KB tail window is longer than `n` — with a
+  settled answer it is the normal case, NOT a sign the answer is cut off. The
+  FULL final text is only available from the WS `message_end` event or
+  `subagent_result`'s `result.finalText`, never from a glimpse.
 
 ---
 

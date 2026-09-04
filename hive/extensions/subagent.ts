@@ -434,6 +434,10 @@ export default function (pi: ExtensionAPI) {
 			"tool_running/done/...) and `complete` (false while the text is a",
 			"live fragment, true once it is the authoritative final output), so",
 			"never mistake a live fragment for a final answer.",
+			"Contract: rely on `complete` as the authoritative is-this-done signal;",
+			"`status` is only a hint and can lag the live state. `truncated: true` just",
+			"means the tail window exceeds `n` — it does NOT mean the answer is cut",
+			"off. For the full text use subagent_result, not glimpse.",
 		].join(" "),
 		parameters: Type.Object({
 			id: Type.String({ description: "Hive subagent id returned by subagent_spawn." }),
