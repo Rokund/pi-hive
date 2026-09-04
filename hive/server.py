@@ -250,9 +250,9 @@ class SubagentFollowupIn(BaseModel):
     prompt: str
 
 
-class SubagentGlimpseIn(BaseModel):
+class AgentGlimpseIn(BaseModel):
     id: str
-    # Max characters of the subagent's live produced text to return (clamped to
+    # Max characters of the agent's live produced text to return (clamped to
     # [1, 1024] server-side; the parent-visible "1K" cap). Optional.
     n: int = 1024
 
@@ -793,20 +793,29 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
             logger.exception("subagent followup failed")
             return {"ok": False, "error": str(exc)}
 
-    @app.post("/hive/subagent/glimpse")
-    async def hive_subagent_glimpse(body: SubagentGlimpseIn) -> Dict[str, Any]:
-        """Peek at the tail of a subagent's live produced text (SPEC §5.1).
+    @app.post("/hive/agent/glimpse")
+    async def hive_agent_glimpse(body: AgentGlimpseIn) -> Dict[str, Any]:
+        """Peek at the tail of any agent's (primary or subagent) live produced text.
 
-        Non-blocking: returns the last N (<= 1024) characters of what the
-        subagent is currently producing — including thinking and tool-call
-        arguments as they stream in — plus phase/complete labels so the caller
-        can tell a live fragment from a final answer. Never starts or waits.
+        Non-blocking: returns the last N (<= 1024) characters of what the agent
+        is currently producing — including thinking and tool-call arguments as
+        they stream in — plus phase/complete labels so the caller can tell a live
+        fragment from a final answer. Never starts or waits.
         """
         try:
-            return await ctx.processes.get_subagent_glimpse(body.id, body.n)
+            return await ctx.processes.get_agent_glimpse(body.id, body.n)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("subagent glimpse failed")
+            logger.exception("agent glimpse failed")
             return {"ok": False, "error": str(exc)}
+
+    @app.post("/hive/subagent/glimpse")
+    async def hive_subagent_glimpse(body: AgentGlimpseIn) -> Dict[str, Any]:
+        """Backward-compatible alias for `/hive/agent/glimpse`.
+
+        Kept so existing callers (the `subagent_glimpse` tool, the python
+        reference client, docs) that still POST here keep working.
+        """
+        return await hive_agent_glimpse(body)
 
     @app.websocket("/ws")
     async def api_ws(websocket: WebSocket) -> None:

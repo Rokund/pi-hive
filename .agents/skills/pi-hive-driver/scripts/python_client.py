@@ -279,18 +279,18 @@ class HiveClient:
         return out
 
     # ------------------------------------------- optional HTTP peek (glimpse) --
-    # The subagent tool endpoints are HTTP and normally called only by the
-    # PRIMARY through its extension. There is no WS command for a peek, so this
-    # optional helper mirrors the extension's exact POST to /hive/subagent/glimpse
-    # using stdlib urllib (no third-party dependency). Driving primaries over WS
-    # never needs it.
-    def subagent_glimpse(
+    # The glimpse endpoint is HTTP and exposed for ANY agent (primary or
+    # subagent).  There is no WS command for a peek, so this optional helper
+    # uses stdlib urllib (no third-party dependency).
+    def agent_glimpse(
         self,
         agent_id: str,
         n: int = 1024,
         api_base: str = "http://127.0.0.1:3001",
     ) -> dict:
-        """Peek at the tail of a subagent's live produced text (HTTP-only).
+        """Peek at the tail of ANY agent's live produced text (HTTP-only).
+
+        Works for both primaries and subagents.
 
         Returns the hive payload: ``{ok, status, phase, complete, truncated,
         totalChars, text}`` (on transport/HTTP failure, ``{ok: False, error}``).
@@ -303,7 +303,7 @@ class HiveClient:
         """
         import urllib.request  # stdlib
 
-        url = f"{api_base}/hive/subagent/glimpse"
+        url = f"{api_base}/hive/agent/glimpse"
         body = {"id": agent_id, "n": int(n)}
         req = urllib.request.Request(
             url,
@@ -315,7 +315,11 @@ class HiveClient:
             with urllib.request.urlopen(req, timeout=self.recv_timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as exc:  # HTTPError / URLError / JSONDecodeError
-            return {"ok": False, "error": f"subagent_glimpse failed: {exc}"}
+            return {"ok": False, "error": f"agent_glimpse failed: {exc}"}
+
+    # Backward-compatible alias: keeps the old name working via the legacy
+    # /hive/subagent/glimpse route (which the server still serves as an alias).
+    subagent_glimpse = agent_glimpse
 
 
 def demo() -> None:

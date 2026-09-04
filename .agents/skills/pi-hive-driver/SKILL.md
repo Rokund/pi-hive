@@ -104,13 +104,15 @@ broadcast event frames on the same socket.
 { "type": "subscribe" }                        // ack; events already flow anyway
 ```
 
-### 2.5 Peek at a subagent's live output (optional, HTTP only)
+### 2.5 Peek at an agent's live output (optional, HTTP only)
 There is no WS command for this; the hive exposes it as
-`POST http://127.0.0.1:3001/hive/subagent/glimpse` with body
-`{"id": "<subagent_id>", "n": <int, clamped to [1, 1024]>}`. The primary calls
-this itself through `subagent_glimpse`; a driver that wants the same view
+`POST http://127.0.0.1:3001/hive/agent/glimpse` with body
+`{"id": "<agent_id>", "n": <int, clamped to [1, 1024]>}`. It works for ANY
+agent — subagents and the primary alike. The primary calls it for its own
+subagents through `subagent_glimpse`; a driver that wants the same view
 out-of-band can use the stdlib-HTTP helper `HiveClient.subagent_glimpse()` in
-`scripts/python_client.py` (urllib — no new dependency). The response carries
+`scripts/python_client.py` (urllib — no new dependency; it still POSTs to the
+legacy `/hive/subagent/glimpse` alias, which remains). The response carries
 `status`, `phase`, `complete`, `truncated`, `totalChars`, `text`; treat
 `complete:false` as a *live fragment*, never a final answer.
 

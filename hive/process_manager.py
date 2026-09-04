@@ -80,7 +80,7 @@ PHASE_TOOLCALLING = "toolcalling"
 PHASE_TOOL_RUNNING = "tool_running"
 
 
-def _append_live_text(st: "_SubagentState", text: str) -> None:
+def _append_live_text(st: "_AgentState", text: str) -> None:
     """Append streamed output to a subagent's bounded live tail + char counter."""
     if not text:
         return
@@ -607,12 +607,13 @@ class PiSubprocess:
                     pass
 
 
-class _SubagentState:
-    """Lightweight runtime tracking of one spawned subagent.
+class _AgentState:
+    """Lightweight runtime tracking of one agent (primary or subagent).
 
     Not persisted; lives only while the hive process is up.  The authoritative
     graph node is in `AgentGraph`; this is purely the result/status side used
-    by the `subagent_result` / `subagent_abort` endpoints.
+    by the `subagent_result` / `subagent_abort` endpoints plus the shared
+    live-output tail used by `get_agent_glimpse`.
     """
 
     def __init__(self) -> None:
@@ -652,6 +653,21 @@ class _SubagentState:
         return self.status in ("done", "failed", "aborted")
 
 
+class AgentRuntime:
+    """Runtime record pairing one agent's live pi process with its state.
+
+    `proc` is None when the process has been reaped/dropped but the record
+    (and its live-output state) is kept for late polls. Bundling the two halves
+    into one object is what lets a rekey move both atomically instead of having
+    to keep two dictionaries in lockstep.
+    """
+
+    def __init__(self, proc: Optional["PiSubprocess"] = None,
+                 state: Optional["_AgentState"] = None) -> None:
+        self.proc: Optional["PiSubprocess"] = proc
+        self.state: Optional["_AgentState"] = state
+
+
 class ProcessManager:
     """Owns all PiSubprocess instances, keyed by node id."""
 
@@ -673,8 +689,12 @@ class ProcessManager:
         # per-call cwd, the profile cwd, and the parent cwd are all unset, so
         # driving programs do not have to run next to the hive's own start dir.
         self.default_cwd = default_cwd or os.getcwd()
-        self._procs: Dict[str, PiSubprocess] = {}
-        self._states: Dict[str, _SubagentState] = {}
+        # One runtime record per agent: its live pi process (or None when the
+        # process has been reaped/dropped but its live-output state is kept) plus
+        # its live-output state. Keeping proc + state in ONE record means a rekey
+        # or a reap moves/clears both halves atomically — the "two dicts must be
+        # moved together" failure mode goes away.
+        self._runtimes: Dict[str, "AgentRuntime"] = {}
         self._streaming: Set[str] = set()  # agent ids currently streaming
         # Last activity timestamp (ms) per agent, for idle reaping.
         self._last_activity: Dict[str, int] = {}
@@ -764,7 +784,7 @@ class ProcessManager:
         async def _on_proc_exit() -> None:
             # Subagent bookkeeping: settle the state so `subagent_result`
             # reports failed instead of running forever.
-            st = self._states.get(node_id)
+            st = self.get_state(node_id)
             if st is not None and st.status == "running":
                 st.status = "failed"
                 st.error = "subagent process exited unexpectedly"
@@ -774,17 +794,19 @@ class ProcessManager:
                 self._streaming.discard(node_id)
                 # Drop the dead process so ensure_loaded can lazily respawn
                 # it (--session) when the user next opens the conversation.
-                dead = self._procs.get(node_id)
-                if dead is not None and dead.proc is not None:
+                # The runtime record (and its live-output state) is kept so a
+                # late glimpse/result poll still has something to report.
+                rt = self._runtimes.get(node_id)
+                if rt is not None and rt.proc is not None:
                     try:
-                        if dead.proc.returncode is None:
+                        if rt.proc.proc.returncode is None:
                             pass  # still terminating; leave cleanup to close()
                         else:
-                            self._procs.pop(node_id, None)
+                            rt.proc = None
                     except Exception:  # noqa: BLE001
-                        self._procs.pop(node_id, None)
-                else:
-                    self._procs.pop(node_id, None)
+                        rt.proc = None
+                elif rt is not None:
+                    rt.proc = None
             # Notify the hive layer; main._on_event turns process_exited into a
             # graph status change + hive:agent_updated broadcast.
             cb = self._route_event(
@@ -837,7 +859,7 @@ class ProcessManager:
         `subagent_glimpse` reflect what the subagent is ACTUALLY producing right
         now instead of flat message_end-only snapshots.
         """
-        st = self._states.get(agent_id)
+        st = self.get_state(agent_id)
         if st is None:
             return
         ev_type = event.get("type")
@@ -910,27 +932,44 @@ class ProcessManager:
         original_id = node.id
         proc = self._make(node)
         with self._lock:
-            self._procs[node.id] = proc
-            self._last_activity[node.id] = _now_ms()
+            # One runtime record holds BOTH the live process and the
+            # live-output state. Created for every agent (primary included) so
+            # the glimpse/live-tail machinery always has something to
+            # accumulate into. setdefault semantics: a caller may have
+            # pre-seeded the state (e.g. spawn_subagent's fresh state) — never
+            # clobber it.
+            rt = self._runtimes.get(original_id)
+            rt_created = rt is None
+            if rt_created:
+                rt = AgentRuntime()
+                self._runtimes[original_id] = rt
+            rt.proc = proc
+            if rt_created:
+                rt.state = _AgentState()
+            self._last_activity[original_id] = _now_ms()
         try:
             await proc.spawn()
         except BaseException:
             with self._lock:
-                self._procs.pop(original_id, None)
+                if rt_created:
+                    # Fresh runtime: drop the whole record.
+                    self._runtimes.pop(original_id, None)
+                else:
+                    # Pre-seeded state (e.g. spawn_subagent's) must survive so
+                    # a failed spawn still reports "failed" via subagent_result.
+                    rt.proc = None
             raise
         # pi may report a real sessionId different from the hive-assigned id
-        # (_query_state mutates node.id). Every keyed structure must move to
-        # the new id together, otherwise lookups by the serialized (new) id
-        # fail with "agent not found" while the sidebar shows that very id.
+        # (_query_state mutates node.id). The single runtime record (proc +
+        # state) must move to the new id together, otherwise lookups by the
+        # serialized (new) id fail with "agent not found".
         new_id = node.id
         if new_id != original_id:
             with self._lock:
-                if original_id in self._procs:
-                    self._procs[new_id] = self._procs.pop(original_id)
+                if original_id in self._runtimes:
+                    self._runtimes[new_id] = self._runtimes.pop(original_id)
                 if original_id in self._last_activity:
                     self._last_activity[new_id] = self._last_activity.pop(original_id)
-                if original_id in self._states:
-                    self._states[new_id] = self._states.pop(original_id)
             if self.graph is not None and self.graph.has_node(original_id):
                 self.graph.rekey_node(original_id, new_id)
             if self.on_rekey is not None:
@@ -942,8 +981,20 @@ class ProcessManager:
         return proc
 
     def get(self, node_id: str) -> Optional[PiSubprocess]:
+        """Return the live PiSubprocess for an agent, or None if reaped/absent.
+
+        A reaped agent still has a runtime record (its live-output state is
+        kept), so this intentionally returns None when only the state remains —
+        callers keep using it as a "is a live process attached?" check.
+        """
         with self._lock:
-            return self._procs.get(node_id)
+            rt = self._runtimes.get(node_id)
+            return rt.proc if rt is not None else None
+
+    def get_state(self, node_id: str) -> Optional["_AgentState"]:
+        """Live-output state for an agent, independent of process liveness."""
+        rt = self._runtimes.get(node_id)
+        return rt.state if rt is not None else None
 
     def forget(self, *node_ids: str) -> None:
         """Drop runtime tracking (process + subagent state) for removed agents.
@@ -954,8 +1005,7 @@ class ProcessManager:
         """
         with self._lock:
             for nid in node_ids:
-                self._procs.pop(nid, None)
-                self._states.pop(nid, None)
+                self._runtimes.pop(nid, None)
 
     async def reap_idle(self, max_idle_ms: int) -> List[str]:
         """Reclaim the process of any agent that has finished and been idle.
@@ -973,7 +1023,7 @@ class ProcessManager:
         """
         now = _now_ms()
         with self._lock:
-            ids = list(self._procs.keys())
+            ids = list(self._runtimes.keys())
         reaped: List[str] = []
         for aid in ids:
             node = None
@@ -995,9 +1045,11 @@ class ProcessManager:
                 await proc.close(abort=True)
             except Exception:  # noqa: BLE001
                 logger.warning("reap close failed for %s", aid[:8])
-            # Drop the process, keep the (done) subagent state for late polls.
+            # Drop the process, keep the (done) state for late polls.
             with self._lock:
-                self._procs.pop(aid, None)
+                rt = self._runtimes.get(aid)
+                if rt is not None:
+                    rt.proc = None
             node.loaded = False
             logger.info(
                 "reaped idle agent %s (%s) after %dms idle",
@@ -1083,9 +1135,10 @@ class ProcessManager:
         if self.graph is not None:
             self.graph.add_node(node)
 
-        st = _SubagentState()
+        st = _AgentState()
         with self._lock:
-            self._states[node.id] = st
+            rt = self._runtimes.setdefault(node.id, AgentRuntime())
+            rt.state = st
 
         try:
             await self.spawn(node)
@@ -1121,7 +1174,7 @@ class ProcessManager:
         current session-file size in bytes) so the caller can see the
         subagent is alive and making headroom instead of guessing it hung.
         """
-        st = self._states.get(node_id)
+        st = self.get_state(node_id)
         if st is None:
             if self.get(node_id) is not None:
                 return {"ok": True, "status": "running", "progress": self._progress(node_id)}
@@ -1149,7 +1202,7 @@ class ProcessManager:
         `lastEventAgeMs`/`recentlyActive` remain the event-level heartbeat.
         """
         progress: Dict[str, Any] = {}
-        st = self._states.get(node_id)
+        st = self.get_state(node_id)
         if st is not None and (st.liveUsage or st.usage):
             progress["usage"] = st.liveUsage or st.usage
         if st is not None:
@@ -1170,7 +1223,7 @@ class ProcessManager:
         progress["streaming"] = streaming
         return progress
 
-    def _result_payload(self, st: _SubagentState, node_id: str = "") -> Dict[str, Any]:
+    def _result_payload(self, st: _AgentState, node_id: str = "") -> Dict[str, Any]:
         if st.status == "done":
             return {
                 "ok": True,
@@ -1192,17 +1245,18 @@ class ProcessManager:
             return {"ok": True, "status": "failed", "error": st.error or "subagent failed"}
         return {"ok": True, "status": "running", "progress": self._progress(node_id)}
 
-    async def get_subagent_glimpse(self, node_id: str, n: int = 1024) -> Dict[str, Any]:
-        """Return the last N characters of what a subagent is producing.
+    async def get_agent_glimpse(self, node_id: str, n: int = 1024) -> Dict[str, Any]:
+        """Return the last N characters of what an agent is producing.
 
-        This is the cheap, non-blocking "peek" — it never waits for completion
-        and never starts the subagent.  It returns the tail of the *live recorded*
-        output stream: text, thinking, and tool-call arguments as they stream in
-        (through the bounded server-side accumulator), or the authoritative final
-        text once a message settles (message_end overwrites the tail so it never
-        drifts from pi's final output).  The payload labels whether the returned
-        text is authoritative (`complete`) and what the subagent was doing
-        (`phase`), so a caller can tell a live fragment from a final answer.
+        Works for ANY agent (primary or subagent). This is the cheap,
+        non-blocking "peek" — it never waits for completion and never starts
+        the agent.  It returns the tail of the *live recorded* output stream:
+        text, thinking, and tool-call arguments as they stream in (through the
+        bounded server-side accumulator), or the authoritative final text once a
+        message settles (message_end overwrites the tail so it never drifts from
+        pi's final output).  The payload labels whether the returned text is
+        authoritative (`complete`) and what the agent was doing (`phase`), so a
+        caller can tell a live fragment from a final answer.
 
         N is clamped to [1, 1024] (the parent-visible "1K" cap).
         """
@@ -1210,14 +1264,14 @@ class ProcessManager:
         # is a boundary the contract says to clamp (0 -> 1). Only an absent value
         # (None, which the route never sends) falls back to the default.
         n = max(1, min(int(n) if n is not None else 1024, 1024))
-        st = self._states.get(node_id)
+        st = self.get_state(node_id)
         node = None
         if self.graph is not None and self.graph.has_node(node_id):
             node = self.graph.get_node(node_id)
         if st is None:
             if node is not None:
                 # Known node, but no live capture in this hive process (e.g. a
-                # metadata-restored or never-streamed subagent).
+                # metadata-restored or never-streamed agent).
                 return {
                     "ok": True,
                     "id": node_id,
@@ -1227,16 +1281,20 @@ class ProcessManager:
                     "truncated": False,
                     "totalChars": 0,
                     "text": "",
-                    "note": "no live output recorded for this subagent in this hive process",
+                    "note": "no live output recorded for this agent in this hive process",
                 }
-            return {"ok": False, "error": f"unknown subagent id: {node_id}"}
+            return {"ok": False, "error": f"unknown agent id: {node_id}"}
 
-        complete = st.status in ("done", "failed", "aborted") or not self.is_streaming(node_id)
+        # The graph node's status is authoritative for BOTH primaries and
+        # subagents (maintained by main._on_event), whereas the in-memory
+        # state.status is only reliably driven for subagents. Prefer the node.
+        status = node.status if node is not None else st.status
+        complete = status in ("done", "failed", "aborted") or not self.is_streaming(node_id)
         text = st.liveText[-n:]
         return {
             "ok": True,
             "id": node_id,
-            "status": st.status,
+            "status": status,
             "phase": st.phase,
             "complete": complete,
             "truncated": len(st.liveText) > len(text),
@@ -1244,17 +1302,18 @@ class ProcessManager:
             "text": text,
         }
 
-    def _fresh_state(self, node_id: str) -> _SubagentState:
-        """Replace the subagent's result state with a fresh `running` one.
+    def _fresh_state(self, node_id: str) -> _AgentState:
+        """Replace the agent's result state with a fresh `running` one.
 
-        Used when reusing a finished subagent (follow-up): the previous
+        Used when reusing a finished agent (follow-up): the previous
         settled outcome is discarded and the new run owns the state so
         `subagent_result` polls the *follow-up* run, not the stale one.
         """
-        st = _SubagentState()
+        st = _AgentState()
         st.status = "running"
         with self._lock:
-            self._states[node_id] = st
+            rt = self._runtimes.setdefault(node_id, AgentRuntime())
+            rt.state = st
         return st
 
     async def followup_subagent(self, node_id: str, prompt: str) -> Dict[str, Any]:
@@ -1345,7 +1404,7 @@ class ProcessManager:
         ``_on_event``). Aborting an already-terminal subagent is a no-op.
         """
         proc = self.get(node_id)
-        st = self._states.get(node_id)
+        st = self.get_state(node_id)
 
         # Aborting an already-terminal subagent keeps its terminal state
         # (documented contract: abort of a done/failed/aborted agent is a no-op).
@@ -1390,7 +1449,9 @@ class ProcessManager:
                 except Exception:  # noqa: BLE001
                     logger.warning("abort close failed for %s", node_id[:8])
                 with self._lock:
-                    self._procs.pop(node_id, None)
+                    rt = self._runtimes.get(node_id)
+                    if rt is not None:
+                        rt.proc = None
                 if self.graph is not None and self.graph.has_node(node_id):
                     node = self.graph.get_node(node_id)
                     if node is not None:
@@ -1445,10 +1506,11 @@ class ProcessManager:
 
     async def shutdown(self, *, timeout: float = 5.0) -> None:
         with self._lock:
-            procs = list(self._procs.values())
+            procs = [rt.proc for rt in self._runtimes.values() if rt.proc is not None]
         await asyncio.gather(
             *(p.close(abort=True, timeout=timeout) for p in procs),
             return_exceptions=True,
         )
         with self._lock:
-            self._procs.clear()
+            for rt in self._runtimes.values():
+                rt.proc = None
