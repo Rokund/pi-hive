@@ -337,20 +337,43 @@ class Hive:
         return reaped
 
     # -- primary bootstrap -------------------------------------------------
+    def _resolve_primary_profile(self, agent: Optional[str]) -> AgentProfile:
+        """Resolve the profile for a new primary conversation.
+
+        When `agent` names an agent, its profile is used and must exist and be
+        primary-eligible (a clear error otherwise). When `agent` is absent, the
+        configured `default_primary` (via the legacy shim when present) is used.
+        """
+        if agent is not None:
+            profile = self.config.profile_by_name(agent)
+            if profile is None:
+                raise ValueError(
+                    f"cannot spawn primary: unknown agent {agent!r}; "
+                    f"known names: {sorted(self.config.known_names())}"
+                )
+            if not self.config.is_primary_eligible(agent):
+                raise ValueError(
+                    f"cannot spawn primary: agent {agent!r} is not primary-eligible "
+                    f"(allow_as_primary is not True, while other agents are flagged)"
+                )
+            return profile
+        return self.config.default_primary_profile()
+
     def make_primary_node(self, label: Optional[str] = None,
                           model: Optional[str] = None,
-                          cwd: Optional[str] = None) -> AgentNode:
-        primary = self.config.primary
-        profile = self.config.profile_by_name(primary.name)
+                          cwd: Optional[str] = None,
+                          agent: Optional[str] = None) -> AgentNode:
+        profile = self._resolve_primary_profile(agent)
         # GUI model selection: override the configured default for this
         # conversation only (the node's own profile snapshot keeps it).
         if model:
             profile = profile.model_copy(update={"model": model})
         # M9: the primary should know its OWN LLM's real constraints (context
         # window, pricing, vision, speed) so it does not misjudge a slow-but-
-        # legitimate subagent. Inject the structured capability profile into
-        # its own system prompt (it never appears in PI_HIVE_SUBAGENTS, which
-        # only describes the subagents the primary can spawn). profile_by_name
+        # legitimate subagent. Inject the structured capability profile derived
+        # from the ACTUAL resolved model (after any `model` override above) into
+        # its own system prompt. It never appears in PI_HIVE_SUBAGENTS, which
+        # only describes the subagents the primary can spawn. profile_by_name
         # returns a fresh copy, so mutating it is safe.
         own_llm = self.config.llm_for_model(profile.model)
         if own_llm is not None:
@@ -360,7 +383,7 @@ class Hive:
         return AgentNode(
             id=uuid.uuid4().hex,
             kind="primary",
-            name=label or primary.name,
+            name=label or profile.name,
             status="idle",
             profile=profile,
             cwd=cwd or profile.cwd or self.default_cwd,
@@ -370,17 +393,19 @@ class Hive:
 
     async def start_primary(self, label: Optional[str] = None,
                             model: Optional[str] = None,
-                            cwd: Optional[str] = None) -> AgentNode:
+                            cwd: Optional[str] = None,
+                            agent: Optional[str] = None) -> AgentNode:
         # Distinguish multiple conversations: first keeps the profile name,
         # later ones get primary-2, primary-3, ...  (node.profile is stored
         # on the node, so spawn-agent_allowlist checks are unaffected by the label.
         # The auto-titler replaces these placeholders with a summary once the
         # first exchange settles.)
+        base_name = self._resolve_primary_profile(agent).name
         if label is None:
             existing = [n for n in self.graph.get_tree() if n.kind == "primary"]
             if existing:
-                label = f"{self.config.primary.name}-{len(existing) + 1}"
-        node = self.make_primary_node(label, model=model, cwd=cwd)
+                label = f"{base_name}-{len(existing) + 1}"
+        node = self.make_primary_node(label, model=model, cwd=cwd, agent=agent)
         self.graph.add_node(node)
         await self.processes.spawn(node)
         self.state.restore_node(node)

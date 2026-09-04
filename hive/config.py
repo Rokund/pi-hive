@@ -10,9 +10,16 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, Dict, List, Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
 from .models import AgentProfile
 
@@ -33,32 +40,13 @@ class ServerConfig(BaseModel):
     maxSubagentIdleMs: int = 120000
 
 
-class PrimaryConfig(BaseModel):
-    # Accept the legacy `allowlist` key for old config files.
-    model_config = ConfigDict(populate_by_name=True)
-
-    name: str = "primary"
-    model: str
-    thinking: Optional[str] = None
-    tools: List[str] = Field(default_factory=list)
-    skills: List[str] = Field(default_factory=list)
-    systemPrompt: Optional[str] = None
-    # Regex/allow-all semantics identical to AgentProfile.agent_allowlist.
-    agent_allowlist: List[str] = Field(
-        default_factory=list,
-        validation_alias=AliasChoices("agent_allowlist", "allowlist"),
-    )
-    # Named MCP servers (keys of ~/.pi/agent/mcp.json) this agent may see; none
-    # by default. Folded into the primary profile (and thus --tools) at spawn.
-    mcp: List[str] = Field(default_factory=list)
-
-
 class LlmProfile(BaseModel):
     """Capability profile of one model, injected to the primary (SPEC §8/M9).
 
-    `name` must equal a model id used by ``primary.model`` or an ``agents[]``
-    entry, so the hive can look the profile up for a given agent. The other
-    fields are free-form descriptions of the things the primary must know to
+    `name` must equal a model id used by an ``agents[]`` entry (which includes
+    the legacy-shimmed primary), so the hive can look the profile up for a
+    given agent. The other fields are free-form descriptions of the things the
+    primary must know to
     judge whether a subagent is "slow" or simply working within real
     constraints (context window, pricing, vision/other capabilities, speed).
     """
@@ -82,10 +70,19 @@ class LlmProfile(BaseModel):
 
 class HiveConfig(BaseModel):
     server: ServerConfig
-    primary: PrimaryConfig
+    # Shared agent registry — the SINGLE source of truth for name resolution
+    # and primary eligibility. The before-validation shim folds any legacy
+    # top-level `primary` block in as the first agent, so there is no separate
+    # primary identity.
     agents: List[AgentProfile] = Field(default_factory=list)
+    # Top-level selector naming the DEFAULT primary agent: the profile used when
+    # a spawn request carries no explicit `agent`. In the legacy-shim case this
+    # resolves to the synthesized primary profile. Optional at load in this
+    # ticket (the strict-required shape is the follow-up); when present it must
+    # reference a primary-eligible agent.
+    default_primary: Optional[str] = None
     # Optional explicit model choices for the GUI "New conversation" picker.
-    # When absent, the GUI falls back to the distinct models of primary/agents.
+    # When absent, the GUI falls back to the distinct models of the registry.
     models: List[str] = Field(default_factory=list)
     # Capability profiles describing the models used by primary/agents, keyed by
     # exact model id. Injected to the primary (subagent entries through the
@@ -93,6 +90,65 @@ class HiveConfig(BaseModel):
     # so it can tell "working within limits" from "stuck" instead of
     # force-stopping a slow subagent.
     llm: List[LlmProfile] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _shim_legacy_primary(cls, data: Any) -> Any:
+        """Tolerate the legacy top-level `primary` block (T1/EXPAND shim).
+
+        Legacy config files carry a top-level ``{"primary": {...}}`` block in
+        place of (or alongside) an ``agents`` registry. To keep them loading
+        and resolving IDENTICALLY to today, this before-validation shim
+        synthesizes an agents-style entry from that block, PREPENDS it to
+        ``data["agents"]`` (creating the list if absent), and defaults the
+        top-level ``default_primary`` to the synthesized primary name. Every
+        synthesized key maps to a valid :class:`~hive.models.AgentProfile`
+        field (with ``max_concurrency=None`` and ``cwd=None``) so the model
+        validates normally.
+
+        A ``"primary"`` key that is present but is NOT a dict (e.g. a bare
+        string or null) is dropped and tolerated — hard rejection of the legacy
+        shape is the follow-up ticket.
+        """
+        if not isinstance(data, dict):
+            return data
+        if "primary" not in data:
+            return data
+        primary = data["primary"]
+        if not isinstance(primary, dict):
+            # Non-dict legacy primary: just drop it, no hard error.
+            data.pop("primary", None)
+            return data
+        # Accept the legacy `allowlist` alias for the same field.
+        allowlist = primary.get("agent_allowlist")
+        if allowlist is None:
+            allowlist = primary.get("allowlist")
+        entry: Dict[str, Any] = {
+            "name": primary.get("name") or "primary",
+            "max_concurrency": None,
+            "cwd": None,
+        }
+        if primary.get("model") is not None:
+            entry["model"] = primary["model"]
+        for key in ("thinking", "systemPrompt"):
+            if primary.get(key) is not None:
+                entry[key] = primary[key]
+        for key in ("tools", "skills"):
+            if primary.get(key) is not None:
+                entry[key] = primary[key]
+        if allowlist is not None:
+            entry["agent_allowlist"] = allowlist
+        if primary.get("mcp") is not None:
+            entry["mcp"] = primary["mcp"]
+        agents = data.get("agents")
+        if not isinstance(agents, list):
+            agents = []
+            data["agents"] = agents
+        agents.insert(0, entry)
+        data.pop("primary", None)
+        if not data.get("default_primary"):
+            data["default_primary"] = entry["name"]
+        return data
 
     def llm_for_model(self, model: str) -> Optional[LlmProfile]:
         """The capability profile whose name matches `model`, if any."""
@@ -103,14 +159,100 @@ class HiveConfig(BaseModel):
                 return p
         return None
 
+    # -- shared agent registry -------------------------------------------
+    # The `agents` list is the SINGLE source of truth for name resolution and
+    # primary eligibility. There is no separate "primary" identity: the
+    # before-validation shim folds any legacy top-level `primary` block into
+    # `agents` as the first entry (and points `default_primary` at it), so
+    # legacy configs load and resolve identically to today.
+
+    def registry_profiles(self) -> List[AgentProfile]:
+        """All agent profiles in the registry (the `agents` list).
+
+        No separate synthesized primary is prepended here — the legacy shim
+        already folded any `primary` block into `agents`, so callers should
+        treat this list as the complete set of resolvable profiles.
+        """
+        return list(self.agents)
+
+    def _registry(self) -> List[AgentProfile]:
+        """Legacy alias for :meth:`registry_profiles` (HTTP API compatibility).
+
+        Retained because hive/server.py still calls ``_registry()``. After the
+        shim there is no synthesized primary to add, so it is just the agents
+        list.
+        """
+        return self.registry_profiles()
+
     def known_names(self) -> List[str]:
-        """All resolvable agent/profile names, including the primary."""
-        return [self.primary.name] + [a.name for a in self.agents]
+        """All agent/profile names, derived solely from the `agents` registry.
+
+        The legacy shim already folds any `primary` block into `agents`, so
+        this includes the primary name for legacy configs — with no
+        separate-primary special-casing.
+        """
+        return [a.name for a in self.agents]
+
+    def profile_by_name(self, name: str) -> Optional[AgentProfile]:
+        """Look up an agent profile by name, from the registry only.
+        Returns None when no such agent exists."""
+        return next((a for a in self.agents if a.name == name), None)
+
+    # -- primary eligibility / default selector ---------------------------
+    def _primary_eligible_names(self) -> List[str]:
+        """Names allowed to serve as a PRIMARY agent.
+
+        Eligibility rule: if NO agent is flagged `allow_as_primary is True`,
+        every agent in the registry is primary-eligible; if any agent is
+        flagged True, ONLY the flagged agents are. The flag never restricts
+        subagent spawnability (any agent can still be spawned as a subagent
+        regardless of this flag).
+        """
+        flagged = [a.name for a in self.agents if a.allow_as_primary is True]
+        if flagged:
+            return flagged
+        return [a.name for a in self.agents]
+
+    def primary_eligibility(self) -> List[str]:
+        """Sorted list of primary-eligible agent names."""
+        return sorted(self._primary_eligible_names())
+
+    def is_primary_eligible(self, name: str) -> bool:
+        """Whether `name` may be used as a primary agent."""
+        return name in self._primary_eligible_names()
+
+    def default_primary_profile(self) -> AgentProfile:
+        """The profile used when a spawn request carries no explicit `agent`.
+
+        Resolves via the top-level `default_primary` selector — which, for
+        legacy configs, the before-validation shim points at the synthesized
+        primary — and validates that it names an existing, primary-eligible
+        agent. Raises ValueError when no `default_primary` is configured or it
+        fails to resolve; callers (primary spawn bootstrap, HTTP API) require a
+        resolvable profile here.
+        """
+        if not self.default_primary:
+            raise ValueError(
+                "no default_primary selector configured; cannot resolve a "
+                "default primary profile"
+            )
+        profile = self.profile_by_name(self.default_primary)
+        if profile is None:
+            raise ValueError(
+                f"default_primary {self.default_primary!r} does not name any "
+                f"agent in the registry; known names: {sorted(self.known_names())}"
+            )
+        if not self.is_primary_eligible(self.default_primary):
+            raise ValueError(
+                f"default_primary {self.default_primary!r} is not primary-eligible "
+                f"(allow_as_primary is not True, while other agents are flagged)"
+            )
+        return profile
 
     def validate(self) -> "HiveConfig":
         """Validate cross-references (SPEC §8 / M5).
 
-        Every `agent_allowlist` entry (on the primary and on every agent) is
+        Every `agent_allowlist` entry (on every agent in the registry) is
         either the allow-all sentinel `"*"` or a regular-expression pattern
         matched against the requested agent name.  Plain-name entries (no
         regex metacharacters) must reference an agent/profile name that
@@ -118,9 +260,14 @@ class HiveConfig(BaseModel):
         instead of silently mis-matching at runtime.  Regex entries are
         checked only for compilability.  An empty list means the agent may
         spawn no subagents (deny-all).
+
+        Also validates primary selection: when `default_primary` is given it
+        must name an existing, primary-eligible agent. `default_primary`
+        remains OPTIONAL at load in this ticket (the strict-required shape is
+        the follow-up).
         """
         known = set(self.known_names())
-        for profile in self._all_profiles():
+        for profile in self.registry_profiles():
             for entry in profile.agent_allowlist:
                 if entry == ALLOW_ALL:
                     continue
@@ -141,7 +288,7 @@ class HiveConfig(BaseModel):
         # M9: an ``llm`` capability entry should reference a model actually in
         # use, or it can never be injected (warning only — a stale entry must
         # not brick startup; it is simply inert).
-        known_models = {p.model for p in self._all_profiles() if p.model}
+        known_models = {p.model for p in self.registry_profiles() if p.model}
         for p in self.llm:
             if p.name not in known_models:
                 logger.warning(
@@ -149,39 +296,22 @@ class HiveConfig(BaseModel):
                     "not be injected. known models: %s",
                     p.name, sorted(known_models),
                 )
+        # Primary selection: `default_primary` is OPTIONAL at load in this
+        # ticket. When present it must name an existing, primary-eligible
+        # agent; the legacy shim already points it at the synthesized primary
+        # for legacy configs.
+        if self.default_primary is not None:
+            if self.default_primary not in known:
+                raise ValueError(
+                    f"default_primary {self.default_primary!r} does not name any "
+                    f"agent in the registry; known names: {sorted(known)}"
+                )
+            if not self.is_primary_eligible(self.default_primary):
+                raise ValueError(
+                    f"default_primary {self.default_primary!r} is not primary-eligible "
+                    f"(allow_as_primary is not True, while other agents are flagged)"
+                )
         return self
-
-    def _all_profiles(self) -> List[AgentProfile]:
-        primary = AgentProfile(
-            name=self.primary.name,
-            model=self.primary.model,
-            thinking=self.primary.thinking,
-            tools=self.primary.tools,
-            skills=self.primary.skills,
-            systemPrompt=self.primary.systemPrompt,
-            agent_allowlist=self.primary.agent_allowlist,
-            max_concurrency=None,
-            mcp=self.primary.mcp,
-        )
-        return [primary] + list(self.agents)
-
-    def profile_by_name(self, name: str) -> Optional[AgentProfile]:
-        if name == self.primary.name:
-            return AgentProfile(
-                name=self.primary.name,
-                model=self.primary.model,
-                thinking=self.primary.thinking,
-                tools=self.primary.tools,
-                skills=self.primary.skills,
-                systemPrompt=self.primary.systemPrompt,
-                agent_allowlist=self.primary.agent_allowlist,
-                max_concurrency=None,
-                mcp=self.primary.mcp,
-            )
-        for p in self.agents:
-            if p.name == name:
-                return p
-        return None
 
 
 def default_config_path() -> Path:

@@ -211,10 +211,16 @@ class RenameIn(BaseModel):
 
 
 class SpawnPrimaryIn(BaseModel):
-    """Optional overrides for a newly spawned primary conversation."""
+    """Optional overrides for a newly spawned primary conversation.
+
+    ``agent`` optionally names the agent profile to use for the new primary
+    (it must exist and be primary-eligible, otherwise the spawn fails with a
+    clear error); when absent, the configured `default_primary` is used.
+    """
     label: Optional[str] = None
     model: Optional[str] = None
     cwd: Optional[str] = None
+    agent: Optional[str] = None
 
 
 class SetModelIn(BaseModel):
@@ -573,6 +579,7 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
                 label=body.label if body else None,
                 model=(body.model.strip() or None) if body and body.model else None,
                 cwd=(body.cwd.strip() or None) if body and body.cwd else None,
+                agent=(body.agent.strip() or None) if body and body.agent else None,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("primary spawn failed")
@@ -625,20 +632,28 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
         """Model choices the GUI can offer when starting a conversation.
 
         Sourced from hive.config.json: an explicit top-level `models` list if
-        present, otherwise the distinct models already used by the configured
-        primary/agents.
+        present, otherwise the distinct models across the agent registry. The
+        `default` choice is the model of the profile named by the
+        `default_primary` selector (via the legacy shim when the old `primary`
+        block is present), or null when no `default_primary` is configured or
+        it does not resolve to a registry agent — never a fixed separate
+        primary block.
         """
         models = list(getattr(ctx.config, "models", []) or [])
         if not models:
             seen: List[str] = []
-            candidates = [ctx.config.primary.model] + [
-                a.model for a in ctx.config.agents
-            ]
+            # Sourced purely from the shared agent registry (which includes the
+            # legacy-shimmed primary when the old `primary` block is present).
+            candidates = [a.model for a in ctx.config._registry()]
             for m in candidates:
                 if m and m not in seen:
                     seen.append(m)
             models = seen
-        default_model = ctx.config.primary.model
+        # Graceful: a valid config may omit `default_primary` (or name an
+        # unknown agent); /api/models must not 500 on that — fall back to
+        # null instead of raising.
+        dp = ctx.config.profile_by_name(ctx.config.default_primary) if ctx.config.default_primary else None
+        default_model = dp.model if dp is not None else None
         return {
             "ok": True,
             "models": models,

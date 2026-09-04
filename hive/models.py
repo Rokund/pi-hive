@@ -39,6 +39,14 @@ class AgentProfile(BaseModel):
     # ``server.maxConcurrentSubagents`` limit.  Advertised to the parent via
     # the subagent tools so the calling LLM knows the per-agent ceiling.
     max_concurrency: Optional[int] = Field(default=None)
+    # Primary-eligibility flag (ticket #2). Optional; when set, determines
+    # whether THIS agent may be used as a primary conversation root:
+    #   - None (unset) on every agent  -> every agent is primary-eligible
+    #   - at least one agent True      -> ONLY the agents flagged True are
+    #     primary-eligible
+    # It never restricts subagent spawnability (any agent can still be spawned
+    # as a subagent regardless of this flag).
+    allow_as_primary: Optional[bool] = Field(default=None)
     # Named MCP servers (keys of the user-level ~/.pi/agent/mcp.json) whose
     # tools this agent may see. An empty list allows none. The hive merges the
     # concrete tool names (the "mcp__<server>" namespace proxy plus the
