@@ -1,7 +1,11 @@
 """Typed configuration loading / validation for `hive.config.json`.
 
-Follows SPEC section 8.  The raw `primary` / `agents` blocks are mapped onto
+Follows SPEC section 8.  The raw `agents` blocks are mapped onto
 `AgentProfile` (from `hive.models`); the `server` block onto `ServerConfig`.
+There is no separate primary block: the primary is an ordinary `agents`
+entry flagged with `allow_as_primary: true` and selected via the top-level
+`default_primary` key.  The legacy top-level `primary` block is REJECTED
+(ticket #3, breaking).
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from pydantic import (
     AliasChoices,
@@ -43,10 +47,9 @@ class ServerConfig(BaseModel):
 class LlmProfile(BaseModel):
     """Capability profile of one model, injected to the primary (SPEC §8/M9).
 
-    `name` must equal a model id used by an ``agents[]`` entry (which includes
-    the legacy-shimmed primary), so the hive can look the profile up for a
-    given agent. The other fields are free-form descriptions of the things the
-    primary must know to
+    `name` must equal a model id used by an ``agents[]`` entry, so the hive can
+    look the profile up for a given agent. The other fields are free-form
+    descriptions of the things the primary must know to
     judge whether a subagent is "slow" or simply working within real
     constraints (context window, pricing, vision/other capabilities, speed).
     """
@@ -71,15 +74,16 @@ class LlmProfile(BaseModel):
 class HiveConfig(BaseModel):
     server: ServerConfig
     # Shared agent registry — the SINGLE source of truth for name resolution
-    # and primary eligibility. The before-validation shim folds any legacy
-    # top-level `primary` block in as the first agent, so there is no separate
-    # primary identity.
+    # and primary eligibility. There is no separate primary identity: the
+    # primary is an ordinary entry in this list, flagged with
+    # `allow_as_primary: true` and selected via `default_primary`.
     agents: List[AgentProfile] = Field(default_factory=list)
-    # Top-level selector naming the DEFAULT primary agent: the profile used when
-    # a spawn request carries no explicit `agent`. In the legacy-shim case this
-    # resolves to the synthesized primary profile. Optional at load in this
-    # ticket (the strict-required shape is the follow-up); when present it must
-    # reference a primary-eligible agent.
+    # Top-level selector naming the DEFAULT primary agent: the profile used
+    # when a spawn request carries no explicit `agent`. REQUIRED at validate()
+    # time — a config without it fails with an error listing the
+    # primary-eligible agents. The field itself stays Optional purely so that
+    # bespoke error can be raised from `validate()` instead of pydantic's
+    # generic missing-field message. Must reference a primary-eligible agent.
     default_primary: Optional[str] = None
     # Optional explicit model choices for the GUI "New conversation" picker.
     # When absent, the GUI falls back to the distinct models of the registry.
@@ -93,61 +97,30 @@ class HiveConfig(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _shim_legacy_primary(cls, data: Any) -> Any:
-        """Tolerate the legacy top-level `primary` block (T1/EXPAND shim).
+    def _reject_legacy_primary(cls, data: Any) -> Any:
+        """REJECT the legacy top-level `primary` block (ticket #3, breaking).
 
-        Legacy config files carry a top-level ``{"primary": {...}}`` block in
-        place of (or alongside) an ``agents`` registry. To keep them loading
-        and resolving IDENTICALLY to today, this before-validation shim
-        synthesizes an agents-style entry from that block, PREPENDS it to
-        ``data["agents"]`` (creating the list if absent), and defaults the
-        top-level ``default_primary`` to the synthesized primary name. Every
-        synthesized key maps to a valid :class:`~hive.models.AgentProfile`
-        field (with ``max_concurrency=None`` and ``cwd=None``) so the model
-        validates normally.
+        Legacy config files carried a top-level ``{"primary": {...}}`` block
+        alongside (or instead of) the ``agents`` registry. The T1 shim used
+        to fold that block into ``agents`` silently; the strict contract now
+        rejects the shape outright so it can never load unnoticed. The
+        primary is configured by giving an ``agents`` entry
+        ``allow_as_primary: true`` and naming it via the top-level
+        ``default_primary`` selector.
 
-        A ``"primary"`` key that is present but is NOT a dict (e.g. a bare
-        string or null) is dropped and tolerated — hard rejection of the legacy
-        shape is the follow-up ticket.
+        ANY value under a top-level ``primary`` key (dict, string, null, …)
+        is rejected. Pydantic surfaces the raised ValueError as a
+        ``ValidationError`` (itself a ``ValueError`` subclass), so both
+        ``HiveConfig.model_validate`` and ``load_config`` fail with this
+        message.
         """
-        if not isinstance(data, dict):
-            return data
-        if "primary" not in data:
-            return data
-        primary = data["primary"]
-        if not isinstance(primary, dict):
-            # Non-dict legacy primary: just drop it, no hard error.
-            data.pop("primary", None)
-            return data
-        # Accept the legacy `allowlist` alias for the same field.
-        allowlist = primary.get("agent_allowlist")
-        if allowlist is None:
-            allowlist = primary.get("allowlist")
-        entry: Dict[str, Any] = {
-            "name": primary.get("name") or "primary",
-            "max_concurrency": None,
-            "cwd": None,
-        }
-        if primary.get("model") is not None:
-            entry["model"] = primary["model"]
-        for key in ("thinking", "systemPrompt"):
-            if primary.get(key) is not None:
-                entry[key] = primary[key]
-        for key in ("tools", "skills"):
-            if primary.get(key) is not None:
-                entry[key] = primary[key]
-        if allowlist is not None:
-            entry["agent_allowlist"] = allowlist
-        if primary.get("mcp") is not None:
-            entry["mcp"] = primary["mcp"]
-        agents = data.get("agents")
-        if not isinstance(agents, list):
-            agents = []
-            data["agents"] = agents
-        agents.insert(0, entry)
-        data.pop("primary", None)
-        if not data.get("default_primary"):
-            data["default_primary"] = entry["name"]
+        if isinstance(data, dict) and "primary" in data:
+            raise ValueError(
+                "the legacy top-level `primary` block is no longer supported: "
+                "move that agent into the `agents` registry with "
+                "`allow_as_primary: true` and select it via the top-level "
+                "`default_primary` key"
+            )
         return data
 
     def llm_for_model(self, model: str) -> Optional[LlmProfile]:
@@ -162,35 +135,28 @@ class HiveConfig(BaseModel):
     # -- shared agent registry -------------------------------------------
     # The `agents` list is the SINGLE source of truth for name resolution and
     # primary eligibility. There is no separate "primary" identity: the
-    # before-validation shim folds any legacy top-level `primary` block into
-    # `agents` as the first entry (and points `default_primary` at it), so
-    # legacy configs load and resolve identically to today.
+    # primary is an `agents` entry flagged `allow_as_primary` and selected
+    # through `default_primary`.
 
     def registry_profiles(self) -> List[AgentProfile]:
         """All agent profiles in the registry (the `agents` list).
 
-        No separate synthesized primary is prepended here — the legacy shim
-        already folded any `primary` block into `agents`, so callers should
-        treat this list as the complete set of resolvable profiles.
+        The complete set of resolvable profiles — the primary included, as
+        an ordinary registry entry.
         """
         return list(self.agents)
 
     def _registry(self) -> List[AgentProfile]:
         """Legacy alias for :meth:`registry_profiles` (HTTP API compatibility).
 
-        Retained because hive/server.py still calls ``_registry()``. After the
-        shim there is no synthesized primary to add, so it is just the agents
-        list.
+        Retained because hive/server.py still calls ``_registry()``; it is
+        just the agents list.
         """
         return self.registry_profiles()
 
     def known_names(self) -> List[str]:
-        """All agent/profile names, derived solely from the `agents` registry.
-
-        The legacy shim already folds any `primary` block into `agents`, so
-        this includes the primary name for legacy configs — with no
-        separate-primary special-casing.
-        """
+        """All agent/profile names, derived solely from the `agents` registry
+        (the primary included, as an ordinary registry entry)."""
         return [a.name for a in self.agents]
 
     def profile_by_name(self, name: str) -> Optional[AgentProfile]:
@@ -224,12 +190,13 @@ class HiveConfig(BaseModel):
     def default_primary_profile(self) -> AgentProfile:
         """The profile used when a spawn request carries no explicit `agent`.
 
-        Resolves via the top-level `default_primary` selector — which, for
-        legacy configs, the before-validation shim points at the synthesized
-        primary — and validates that it names an existing, primary-eligible
-        agent. Raises ValueError when no `default_primary` is configured or it
-        fails to resolve; callers (primary spawn bootstrap, HTTP API) require a
-        resolvable profile here.
+        Resolves via the top-level `default_primary` selector and validates
+        that it names an existing, primary-eligible agent. Raises ValueError
+        when no `default_primary` is configured or it fails to resolve;
+        callers (primary spawn bootstrap, HTTP API) require a resolvable
+        profile here. (`validate()` already rejects configs without a
+        `default_primary`, so the no-selector branch below is a defensive
+        check for programmatically built configs.)
         """
         if not self.default_primary:
             raise ValueError(
@@ -261,10 +228,12 @@ class HiveConfig(BaseModel):
         checked only for compilability.  An empty list means the agent may
         spawn no subagents (deny-all).
 
-        Also validates primary selection: when `default_primary` is given it
-        must name an existing, primary-eligible agent. `default_primary`
-        remains OPTIONAL at load in this ticket (the strict-required shape is
-        the follow-up).
+        Also enforces the strict primary-selection contract (ticket #3,
+        breaking): the legacy top-level `primary` block is rejected at
+        model-validate time by `_reject_legacy_primary`, `default_primary` is
+        REQUIRED (a missing/empty selector is a hard error listing the
+        primary-eligible agents), and a present `default_primary` must name
+        an existing, primary-eligible agent.
         """
         known = set(self.known_names())
         for profile in self.registry_profiles():
@@ -296,21 +265,29 @@ class HiveConfig(BaseModel):
                     "not be injected. known models: %s",
                     p.name, sorted(known_models),
                 )
-        # Primary selection: `default_primary` is OPTIONAL at load in this
-        # ticket. When present it must name an existing, primary-eligible
-        # agent; the legacy shim already points it at the synthesized primary
-        # for legacy configs.
-        if self.default_primary is not None:
-            if self.default_primary not in known:
-                raise ValueError(
-                    f"default_primary {self.default_primary!r} does not name any "
-                    f"agent in the registry; known names: {sorted(known)}"
-                )
-            if not self.is_primary_eligible(self.default_primary):
-                raise ValueError(
-                    f"default_primary {self.default_primary!r} is not primary-eligible "
-                    f"(allow_as_primary is not True, while other agents are flagged)"
-                )
+        # Primary selection (strict, ticket #3): `default_primary` is
+        # REQUIRED. The eligible set is computed by the exact same rule as
+        # `primary_eligibility()` (single source of truth — this calls it):
+        # when NO agent is flagged `allow_as_primary is True` every agent is
+        # eligible; otherwise only the flagged ones are. A missing/empty
+        # selector is a hard error listing the eligible agents; a present one
+        # must name a known, primary-eligible agent.
+        if not self.default_primary:
+            raise ValueError(
+                "missing required `default_primary`: name the default "
+                "primary agent; primary-eligible agents: "
+                f"{self.primary_eligibility()}"
+            )
+        if self.default_primary not in known:
+            raise ValueError(
+                f"default_primary {self.default_primary!r} does not name any "
+                f"agent in the registry; known names: {sorted(known)}"
+            )
+        if not self.is_primary_eligible(self.default_primary):
+            raise ValueError(
+                f"default_primary {self.default_primary!r} is not primary-eligible "
+                f"(allow_as_primary is not True, while other agents are flagged)"
+            )
         return self
 
 

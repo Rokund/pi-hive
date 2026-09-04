@@ -1,4 +1,5 @@
 {
+  "_comment": "New config shape: the primary is an ordinary `agents` entry with `allow_as_primary: true`, selected via the top-level `default_primary` key. The legacy top-level `primary` block is rejected at load time. Replace YOUR_PRIMARY_MODEL / YOUR_WORKER_MODEL with real model ids (and matching `llm` profile names).",
   "server": {
     "bind": "127.0.0.1",
     "guiPort": 3000,
@@ -6,27 +7,30 @@
     "maxConcurrentSubagents": 20,
     "maxSubagentIdleMs": 120000
   },
-  "primary": {
-    "name": "primary",
-    "model": "YOUR_PRIMARY_MODEL",
-    "thinking": "median",
-    "skills": [
-      "*"
-    ],
-    "systemPrompt": "You are a primary orchestrator. Delegate tasks to subagents, avoiding wasting context window on detail and keeping the whole-project view.",
-    "agent_allowlist": [
-      "tester",
-      "coder",
-      "reviewer"
-    ],
-    "tools": [
-      "read",
-      "grep",
-      "find"
-    ],
-    "mcp": []
-  },
   "agents": [
+    {
+      "name": "primary",
+      "model": "YOUR_PRIMARY_MODEL",
+      "thinking": "median",
+      "max_concurrency": null,
+      "allow_as_primary": true,
+      "tools": [
+        "read",
+        "grep",
+        "find"
+      ],
+      "skills": [
+        "*"
+      ],
+      "cwd": null,
+      "systemPrompt": "You are a primary orchestrator. Delegate tasks to subagents, avoiding wasting context window on detail and keeping the whole-project view.",
+      "agent_allowlist": [
+        "tester",
+        "coder",
+        "reviewer"
+      ],
+      "mcp": []
+    },
     {
       "name": "tester",
       "model": "YOUR_WORKER_MODEL",
@@ -89,6 +93,7 @@
       "mcp": []
     }
   ],
+  "default_primary": "primary",
   "llm": [
     {
       "name": "YOUR_PRIMARY_MODEL",
