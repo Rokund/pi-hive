@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -852,7 +853,13 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
 # ---------------------------------------------------------------------------
 # Port 1 (GUI) app
 # ---------------------------------------------------------------------------
-def create_gui_app(broadcaster: EventBroadcaster, graph: "AgentGraph | None" = None) -> FastAPI:
+def create_gui_app(
+    broadcaster: EventBroadcaster,
+    graph: "AgentGraph | None" = None,
+    *,
+    api_port: int = 3001,
+    gui_port: int = 3000,
+) -> FastAPI:
     app = FastAPI(title="pi-hive GUI", version="0.1.0")
 
     @app.get("/health")
@@ -909,6 +916,34 @@ def create_gui_app(broadcaster: EventBroadcaster, graph: "AgentGraph | None" = N
     # above (/health, /ws) take precedence over the mount.
     gui_dist = Path(__file__).resolve().parent / "gui" / "dist"
     if gui_dist.is_dir():
+        index = gui_dist / "index.html"
+
+        # The frontend must learn the real apiPort (Port 2) and guiPort (Port 1)
+        # without hardcoding them, since both are configurable via hive.config.json
+        # `server.*Port`. Inject a tiny runtime config script into the served page:
+        # the bundle reads `window.__PI_HIVE_CONFIG__` and derives the GUI
+        # WebSocket from its own origin (same port as this page).
+        def _config_script() -> str:
+            payload = json.dumps(
+                {"apiPort": api_port, "guiPort": gui_port},
+                separators=(",", ":"),
+            ).replace("</", "<\\/")
+            return (
+                "<script>window.__PI_HIVE_CONFIG__="
+                + payload
+                + ";</script>"
+            )
+
+        @app.get("/", include_in_schema=False)
+        async def gui_index() -> Response:
+            html = index.read_text(encoding="utf-8")
+            script = _config_script()
+            head_end = "</head>"
+            if head_end in html:
+                return HTMLResponse(html.replace(head_end, script + head_end, 1))
+            # No </head>? Prepend the config so it always runs before the bundle.
+            return HTMLResponse(script + html)
+
         app.mount("/", StaticFiles(directory=str(gui_dist), html=True), name="gui")
     else:
         import logging

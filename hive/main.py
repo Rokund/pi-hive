@@ -575,7 +575,10 @@ async def _run_servers(hive: Hive, stop: asyncio.Event) -> None:
     bind = hive.config.server.bind
 
     gui_server = uvicorn.Server(
-        uvicorn.Config(create_gui_app(hive.broadcaster, graph=hive.graph), host=bind, port=gui_port, log_level="info")
+        uvicorn.Config(
+            create_gui_app(hive.broadcaster, graph=hive.graph, api_port=api_port, gui_port=gui_port),
+            host=bind, port=gui_port, log_level="info",
+        )
     )
     api_server = uvicorn.Server(
         uvicorn.Config(create_api_app(hive.api_context), host=bind, port=api_port, log_level="info")
