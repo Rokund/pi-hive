@@ -43,3 +43,6 @@ hive/hive.config.json
 # ---- Local copies / scratch (not committed) ----
 pi/
 .agent_work/
+
+# ---- Machine-specific local notes (contains sensitive host info) ----
+docs/agents/issue-tracker.local.md
