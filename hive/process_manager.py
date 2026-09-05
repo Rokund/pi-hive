@@ -88,6 +88,30 @@ def _append_live_text(st: "_AgentState", text: str) -> None:
     st.liveOutputChars += len(text)
 
 
+def _usage_is_noise(usage: Any) -> bool:
+    """True when a usage snapshot has no positive counter anywhere.
+
+    Some providers/servers (notably local OpenAI-compatible / vLLM endpoints)
+    report a zero-filled usage object on every streamed snapshot and only fill
+    real numbers on the final ``done`` event. Emitting that all-zero object in
+    ``subagent_result.progress`` reads as "stalled" while the subagent is
+    actually producing, so callers only learn about ``usage`` once it is
+    informative. None / non-dict / non-numeric values are treated as noise.
+    """
+    if not isinstance(usage, dict):
+        return True
+    stack = list(usage.values())
+    while stack:
+        v = stack.pop()
+        if isinstance(v, dict):
+            stack.extend(v.values())
+        elif isinstance(v, (list, tuple)):
+            stack.extend(v)
+        elif isinstance(v, (int, float)) and v > 0:
+            return False
+    return True
+
+
 # enabled whenever any MCP server is allowed (ADR-0002).
 MCP_GATEWAY_TOOLS = ("mcp", "mcpScript")
 
@@ -1196,21 +1220,31 @@ class ProcessManager:
     def _progress(self, node_id: str) -> Dict[str, Any]:
         """Liveness/progress signals for a still-running subagent.
 
-        The moving counters are the primary anti-stall signal: `usage` is the
-        latest provider-reported usage (forwarded on each streamed event, not
-        just at completion) and `liveOutputChars` is a monotonic count of chars
-        streamed by the model (text + thinking + tool-call arguments). Both grow
-        while the subagent is actually producing. `phase` labels best-effort
-        what it is doing (generating/thinking/toolcalling/tool_running) so a
-        caller that refuses to trust simple flags gets an honest description.
-        `lastEventAgeMs`/`recentlyActive` remain the event-level heartbeat.
+        The authoritative anti-stall signal is the event-layer heartbeat:
+        `recentlyActive` (true while events are still arriving), `lastEventAgeMs`
+        and `streaming`. `phase` labels best-effort what the agent is doing.
+
+        The numeric counters are emitted only when they carry information, so a
+        healthy-but-quiet subagent never reads as "stalled zeros":
+          * `usage` is present only when the provider sent a non-zero token
+            counter (some local OpenAI-compatible/vLLM servers report a
+            zero-filled usage object on every streamed snapshot and only fill
+            real numbers on the final `done` event);
+          * `liveOutputChars` is present only once it has moved (> 0). It is a
+            monotonic count of chars the model streamed (text + thinking +
+            tool-call arguments) and stays 0 during silent prefix/TTFT windows
+            and for the whole of a tool run (tool output is not model text).
+        Neither counter is a substitute for the heartbeat: a working subagent
+        that is thinking or running tools legitimately reports neither.
         """
         progress: Dict[str, Any] = {}
         st = self.get_state(node_id)
-        if st is not None and (st.liveUsage or st.usage):
-            progress["usage"] = st.liveUsage or st.usage
         if st is not None:
-            progress["liveOutputChars"] = st.liveOutputChars
+            live_usage = st.liveUsage or st.usage
+            if not _usage_is_noise(live_usage):
+                progress["usage"] = live_usage
+            if st.liveOutputChars:
+                progress["liveOutputChars"] = st.liveOutputChars
             progress["phase"] = st.phase
         with self._lock:
             last = self._last_activity.get(node_id)

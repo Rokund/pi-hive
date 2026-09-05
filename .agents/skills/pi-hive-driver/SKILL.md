@@ -177,16 +177,20 @@ Treat `message_end` + a completion signal (node status, or `agent_settled`) as
    subagent and can't reach an idle one (that needs `subagent_followup`). Since
    the primary authors these, keep them as natural next-step instructions, not
    "ignore your instructions" (which models may mistake for a prompt injection).
-8. **Working ≠ stalled.** A subagent can spend a long time thinking or building
-   tool-call arguments; its token/byte aggregates look static while it works.
-   The primary's `subagent_result` `progress` is the honest signal:
-   `recentlyActive` (true while events are arriving) plus the *moving* counters
-   `liveOutputChars` and `usage` and a `phase` (`thinking` / `generating` /
-   `toolcalling` / `tool_running`) mean it is producing. Do not force-stop a
-   primary just because a subagent it spawned has gone quiet for a while — if
-   you must look, watch that subagent's own event stream (thinking deltas, tool
-   execution) rather than guessing from silence. `sessionBytes` is gone; rely
-   on the fields above, not file-size heuristics.
+8. **Working ≠ stalled.** A subagent can spend a long time thinking or running
+   tools; the `subagent_result` `progress` block is the honest signal only via
+   its event-layer fields: `recentlyActive` (true while events are arriving),
+   `lastEventAgeMs`, `streaming` and `phase` (`thinking` / `generating` /
+   `toolcalling` / `tool_running`). The numeric fields are OPTIONAL and appear
+   only once they carry information — `liveOutputChars` once the model has
+   streamed output, `usage` once the provider reports a non-zero counter — so
+   a healthy-but-quiet subagent (silent TTFT, long tool runs, local endpoints
+   that report usage only at completion) legitimately shows neither. Absence is
+   NOT a stall. Do not force-stop a primary just because a subagent it spawned
+   has gone quiet for a while — if you must look, watch that subagent's own
+   event stream (thinking deltas, tool execution) rather than guessing from
+   silence. `sessionBytes` is gone; rely on the fields above, not file-size
+   heuristics.
 
 ---
 
