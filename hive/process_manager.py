@@ -335,11 +335,21 @@ def build_rpc_args(profile: AgentProfile, node_id: str, session_file: Optional[s
         # line keeps every flag on the same cmd line with unchanged meaning.
         prompt = " ".join(profile.systemPrompt.split())
         args += ["--system-prompt", prompt]
-    if session_file:
-        # Restore mode: reload the persisted history. pi adopts the session
-        # id from the file (which equals our node id), keeping ids stable.
+    if session_file and os.path.exists(session_file):
+        # Restore mode with real history on disk: reload the persisted file.
+        # pi adopts the session id from the file (== our node id), so ids stay
+        # stable across restarts (verified: --session <file> keeps the id).
         args += ["--session", session_file]
     else:
+        # No persisted history, or the recorded file is missing (e.g. a
+        # brand-new conversation that never produced a turn and was reaped
+        # before anything was written to disk). Pin the exact hive node id
+        # with --session-id instead of --session <missing file>; pi then uses
+        # that id (find-or-create) rather than minting a fresh one, which
+        # would rekey the node -> orphan the GUI selection -> drop the
+        # in-flight prompt ("sending to an archived session jumps to an empty
+        # page" bug). --session and --session-id cannot be combined, so this
+        # is the safe single-flag choice when there is nothing to load.
         args += ["--session-id", node_id]
     if profile.name != "primary":
         args += ["--name", profile.name]

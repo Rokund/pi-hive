@@ -88,7 +88,7 @@ export function hiveReducer(state: HiveState, action: HiveAction): HiveState {
         selectedId:
           state.selectedId && known.has(state.selectedId)
             ? state.selectedId
-            : state.selectedId,
+            : null,
       };
     }
     case "event":
