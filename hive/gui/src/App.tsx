@@ -70,12 +70,16 @@ export default function App() {
   const [state, dispatch] = useReducer(hiveReducer, undefined, initHiveState);
   const [starting, setStarting] = useState(false);
   const [models, setModels] = useState<string[]>([]);
+  // Model chosen for the next new conversation (sidebar picker). Defaults to
+  // the server-provided `default` so the plain button keeps today's behavior.
+  const [newModel, setNewModel] = useState<string>("");
 
   // Load the selectable model list (from hive.config.json) once on mount.
   useEffect(() => {
     void fetchModels().then((m) => {
       if (m.ok && m.models && m.models.length > 0) {
         setModels(m.models);
+        if (m.default) setNewModel(m.default);
       }
     });
   }, []);
@@ -131,7 +135,9 @@ export default function App() {
     if (starting) return;
     setStarting(true);
     try {
-      const id = await startNewConversation();
+      // Pass the model selected in the sidebar (or the configured default
+      // when none was chosen) so the new conversation runs on it.
+      const id = await startNewConversation(newModel || undefined);
       if (id) selectAgent(id);
     } finally {
       setStarting(false);
@@ -214,6 +220,21 @@ export default function App() {
         >
           ＋ New conversation
         </button>
+        {models.length > 0 ? (
+          <label className="new-chat-model">
+            <span>model</span>
+            <select
+              className="model-select"
+              value={newModel}
+              onChange={(e) => setNewModel(e.target.value)}
+              title="Model the next new conversation runs on"
+            >
+              {models.map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+          </label>
+        ) : null}
         <AgentTree
           tree={state.tree}
           selectedId={state.selectedId}

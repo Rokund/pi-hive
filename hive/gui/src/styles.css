@@ -542,6 +542,27 @@ body {
   background: rgba(127, 127, 127, 0.22);
 }
 
+/* Model picker for the next new conversation (sidebar, under the New
+   conversation button). Reuses the node-meta .model-select look. */
+.new-chat-model {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -4px 0 12px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: #7a8494;
+  background: rgba(127, 127, 127, 0.08);
+  border: 1px solid rgba(127, 127, 127, 0.2);
+  border-radius: 6px;
+}
+.new-chat-model .model-select {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 11px;
+}
+
 /* Model combobox inside node-meta (detail panel header) */
 .model-field {
   display: flex;
