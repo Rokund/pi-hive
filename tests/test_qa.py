@@ -161,6 +161,28 @@ def _pending(client: TestClient, frm: str):
     return client.post("/hive/agent/pending_questions", json={"from": frm})
 
 
+class FlakyProcessManager(FakeProcessManager):
+    """FakeProcessManager that can fail steer and/or wake delivery."""
+
+    def __init__(self, live=(), steer_raise=False,
+                 followup_ok=True, followup_raise=False):
+        super().__init__(live=live)
+        self.steer_raise = steer_raise
+        self.followup_ok = followup_ok
+        self.followup_raise = followup_raise
+
+    async def send_command(self, agent_id: str, cmd: Dict[str, Any]) -> None:
+        if self.steer_raise:
+            raise RuntimeError("steer exploded")
+        await super().send_command(agent_id, cmd)
+
+    async def followup_subagent(self, node_id: str, prompt: str) -> Dict[str, Any]:
+        self.followups.append({"agent": node_id, "prompt": prompt})
+        if self.followup_raise:
+            raise RuntimeError("wake exploded")
+        return {"ok": self.followup_ok, "id": node_id}
+
+
 # ---------------------------------------------------------------------------
 # (a) scope
 # ---------------------------------------------------------------------------
@@ -419,6 +441,108 @@ def test_store_prune_keeps_at_least_the_cap_when_idle():
         store.create(frm=PRIMARY, to=CHILD1, question=f"q{i}")
     assert store.prune() == 0  # nothing answered -> nothing to drop
     assert len(store.pending_asked_by(PRIMARY)) == 5
+
+
+# ---------------------------------------------------------------------------
+# (d) delivery — failure paths
+# ---------------------------------------------------------------------------
+def test_steer_failure_falls_back_to_wake_path():
+    # Addressee HAS a live process but its steer fails: _qa_deliver_question
+    # must fall back to the wake (followup) path and still report delivered.
+    pm = FlakyProcessManager(live=(CHILD1,), steer_raise=True)
+    client, _, pm = _client(processes=pm)
+    body = _ask(client, PRIMARY, "Fallback?", to=CHILD1).json()
+    assert body["ok"] is True
+    assert body["delivered"] is True
+    assert _steers_for(pm, CHILD1) == []  # the steer never went through
+    assert len(pm.followups) == 1
+    wake = pm.followups[0]
+    assert wake["agent"] == CHILD1
+    assert body["questionId"] in wake["prompt"]
+
+
+def test_wake_failure_leaves_question_pending_for_pull():
+    # No live process AND the wake raises: ask still succeeds (the question
+    # is recorded), delivered=false, and the question stays retrievable via
+    # question_status / pending_questions (best-effort delivery).
+    pm = FlakyProcessManager(followup_raise=True)
+    client, _, pm = _client(processes=pm)
+    body = _ask(client, PRIMARY, "Unreachable?", to=CHILD1).json()
+    assert body["ok"] is True
+    assert body["delivered"] is False
+    qid = body["questionId"]
+    assert _status(client, PRIMARY, qid).json()["question"]["status"] == "pending"
+    assert [q["id"] for q in _pending(client, PRIMARY).json()["questions"]] == [qid]
+
+
+def test_wake_returning_not_ok_reports_undelivered():
+    pm = FlakyProcessManager(followup_ok=False)
+    client, _, _ = _client(processes=pm)
+    body = _ask(client, PRIMARY, "Wake said no?", to=CHILD1).json()
+    assert body["ok"] is True
+    assert body["delivered"] is False
+
+
+def test_answer_delivered_false_when_asker_process_gone():
+    # Idle asker: answer is recorded but steer delivery is skipped ->
+    # delivered=false on the answer response.
+    client, _, _ = _client(live=(CHILD1,))  # PRIMARY idle
+    qid = _ask(client, PRIMARY, "Q", to=CHILD1).json()["questionId"]
+    body = _answer(client, CHILD1, qid, "a").json()
+    assert body["ok"] is True
+    assert body["delivered"] is False
+
+
+def test_answer_delivered_true_when_asker_running():
+    client, _, _ = _client(live=(PRIMARY, CHILD1))
+    qid = _ask(client, PRIMARY, "Q", to=CHILD1).json()["questionId"]
+    body = _answer(client, CHILD1, qid, "a").json()
+    assert body["ok"] is True
+    assert body["delivered"] is True
+
+
+def test_answer_steer_failure_still_records_answer():
+    # Running asker whose steer injection fails: the answer is still
+    # recorded (exactly-once stands) and just reported undelivered.
+    pm = FlakyProcessManager(live=(PRIMARY, CHILD1), steer_raise=True)
+    client, _, pm = _client(processes=pm)
+    qid = _ask(client, PRIMARY, "Q", to=CHILD1).json()["questionId"]
+    body = _answer(client, CHILD1, qid, "recorded anyway").json()
+    assert body["ok"] is True
+    assert body["delivered"] is False
+    st = _status(client, PRIMARY, qid).json()
+    assert st["question"]["status"] == "answered"
+    assert st["answer"] == "recorded anyway"
+
+
+# ---------------------------------------------------------------------------
+# (c) wire-input aliases + unknown-agent pull
+# ---------------------------------------------------------------------------
+def test_frm_alias_accepted_instead_of_from():
+    # All four QA routes must accept `frm` as well as `from` (the JSON wire
+    # key is `from`; `frm` is the Python-friendly alias on the input models).
+    client, _, _ = _client()
+    qid = client.post("/hive/agent/ask", json={
+        "frm": PRIMARY, "question": "alias?", "to": CHILD1,
+    }).json()["questionId"]
+    assert qid
+    assert client.post("/hive/agent/answer", json={
+        "frm": CHILD1, "questionId": qid, "text": "ok",
+    }).json()["ok"] is True
+    assert client.post("/hive/agent/question_status", json={
+        "frm": PRIMARY, "questionId": qid,
+    }).json()["ok"] is True
+    assert client.post("/hive/agent/pending_questions", json={
+        "frm": PRIMARY,
+    }).json()["ok"] is True
+
+
+def test_pending_questions_unknown_agent_rejected():
+    client, _, _ = _client()
+    body = _pending(client, "ghost").json()
+    assert body["ok"] is False
+    assert body["questions"] == []
+    assert "ghost" in body["error"]
 
 
 def test_store_answer_exactly_once_and_unknown_id():
