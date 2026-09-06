@@ -1577,17 +1577,41 @@ class ProcessManager:
         executing its tool calls, before its next model call — so this redirects
         a subagent that is already working (down the wrong path, or to call one
         of its own tools) WITHOUT aborting it; use `abort_subagent` to stop it
-        instead. Steer only reaches a live process: a reaped/idle subagent has no
-        live turn to steer, so the caller should use `followup_subagent` to
-        continue an already-finished one.
+        instead.
+
+        Truthful delivery (the e2e lesson from the Q&A channel): process
+        existence is NOT run state — pi silently drops a steer sent to an
+        agent with no live turn, so answering ``steered`` would be a lie. The
+        steer is therefore only attempted when the target is actually
+        mid-turn (process present AND (streaming OR node status ``running``));
+        a settled-but-loaded target gets an explicit ``skipped`` response
+        (``delivered: false``) pointing at ``subagent_followup`` instead. A
+        residual race remains — the target may settle between the check and
+        the send; pi drops that steer silently, same as before.
         """
+        if self.get(node_id) is None:
+            return {"ok": False, "error": f"subagent not running: {node_id}"}
+        node_status = None
+        if self.graph is not None and self.graph.has_node(node_id):
+            node_status = self.graph.get_node(node_id).status
+        if not (self.is_streaming(node_id) or node_status == "running"):
+            return {
+                "ok": True,
+                "id": node_id,
+                "status": "skipped",
+                "delivered": False,
+                "reason": (
+                    "no live turn to steer (agent is done/idle); "
+                    "use subagent_followup to continue it"
+                ),
+            }
         try:
             await self.send_command(node_id, {"type": "steer", "message": message})
         except ValueError as exc:
             return {"ok": False, "error": f"subagent not running: {exc}"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"could not steer subagent: {exc}"}
-        return {"ok": True, "id": node_id, "status": "steered"}
+        return {"ok": True, "id": node_id, "status": "steered", "delivered": True}
 
     async def shutdown(self, *, timeout: float = 5.0) -> None:
         with self._lock:

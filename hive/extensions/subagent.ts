@@ -352,9 +352,10 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "text",
 						text: JSON.stringify(
-							result.ok
-								? { ok: true, id: params.id, status: "steered" }
-								: { ok: false, error: result.error },
+							// Server envelope verbatim: the route reports skipped/delivered
+							// truthfully; fabricating status:"steered" client-side would lie
+							// for settled targets (same bug class the Q&A review caught).
+							result.ok ? result.data : { ok: false, error: result.error },
 						),
 					},
 				],

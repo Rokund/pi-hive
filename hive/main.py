@@ -472,6 +472,23 @@ class Hive:
                     f" ({event.get('reason')})" if event.get("reason") else "",
                 )
 
+        if ev_type == "agent_settled" and self.graph.has_node(agent_id):
+            # Make the settle event SELF-DESCRIBING for event-stream drivers:
+            # subagents settle to ``done`` (terminal) while primaries settle to
+            # ``idle`` (a resting conversation, continuable via prompt). The
+            # distinction lives in the graph, not in pi's raw event, so attach
+            # the hive-computed post-settle state to avoid forcing every
+            # driver to memorize (or round-trip get_tree for) the convention.
+            settled_node = self.graph.get_node(agent_id)
+            event = {
+                **event,
+                "settled": {
+                    "kind": settled_node.kind,
+                    "status": settled_node.status,
+                    "terminal": settled_node.status in ("done", "failed", "aborted"),
+                },
+            }
+
         await self.broadcaster.publish(_wrap_event(agent_id, event))
         # Keep the GUI sidebar in sync: the tree only refreshes node fields
         # via hive:agent_updated, so push it whenever a status transition

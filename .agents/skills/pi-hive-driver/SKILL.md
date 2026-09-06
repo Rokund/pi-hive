@@ -84,7 +84,10 @@ broadcast event frames on the same socket.
 { "type": "follow_up", "agentId": "<id>", "text": "Summarize in 3 bullets." }
 ```
 - `prompt` with an `agentId` = continue that conversation (lazily restored if idle).
-- `steer` = mid-stream guidance to a **running** agent.
+- `steer` = mid-stream guidance to a **running** agent (the agent-facing
+  `subagent_steer` tool reports `status:"skipped", delivered:false` for a
+  settled target; the thin WS `steer` relay just forwards, so prefer steering
+  agents you know are running).
 - `follow_up` = queued until the agent finishes; on an **idle** agent use `prompt`.
 
 ### 2.3 Abort
@@ -119,7 +122,10 @@ legacy `/hive/subagent/glimpse` alias, which remains). The response carries
   `status` is a reference label only — primaries settle to `idle` while
   subagents settle to `done`, and it can briefly disagree with the live state
   (e.g. at the moment of an abort), so do not use `status` alone to judge
-  completeness.
+  completeness. The WS `agent_settled` event is self-describing: its
+  `settled` block carries `{kind, status, terminal}` computed by the hive
+  after the settle, so drivers never need to memorize (or round-trip
+  `get_tree` for) the idle-vs-done convention.
 - `totalChars` is a monotonic per-process counter of everything streamed since
   the process started (the same number as `subagent_result`'s progress
   `liveOutputChars`); it is NOT the length of the returned `text` and is never
