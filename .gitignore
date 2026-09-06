@@ -44,5 +44,8 @@ hive/hive.config.json
 pi/
 .agent_work/
 
+# ---- graphify knowledge graph output (regenerable build artifacts) ----
+graphify-out/
+
 # ---- Machine-specific local notes (contains sensitive host info) ----
 docs/agents/issue-tracker.local.md
