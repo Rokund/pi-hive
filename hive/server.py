@@ -273,6 +273,14 @@ class AgentGlimpseIn(BaseModel):
     n: int = 1024
 
 
+class AgentWaitIn(BaseModel):
+    """POST /hive/agent/wait — long-poll up to `wait_time` ms for an agent
+    (primary or subagent) to settle (#5). 0 = return the current state now."""
+
+    id: str
+    wait_time: int = 0
+
+
 # -- inter-agent Q&A (ADR-0001 / issue #4) ---------------------------------
 # Wire bodies use the JSON keys {from, to, questionId, ...}; `from` is a
 # reserved Python word, so the models accept it via an alias.
@@ -1033,6 +1041,23 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
         reference client, docs) that still POST here keep working.
         """
         return await hive_agent_glimpse(body)
+
+    @app.post("/hive/agent/wait")
+    async def hive_agent_wait(body: AgentWaitIn) -> Dict[str, Any]:
+        """Long-poll for an agent's (primary OR subagent) current turn to settle.
+
+        HTTP drivers should use this instead of sleep-polling
+        `GET /api/agent/{id}`: it returns the moment the agent settles (up to
+        `wait_time` ms) and never wakes/materializes a settled or unloaded
+        agent. Unknown ids are rejected; a still-running agent returns
+        `{ok:true, id, status:"running", progress:{...}}` so the caller can
+        re-issue the call.
+        """
+        try:
+            return await ctx.processes.wait_for_agent(body.id, body.wait_time or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("agent wait failed")
+            return {"ok": False, "error": str(exc)}
 
     # -- inter-agent Q&A (ADR-0001 / issue #4) ----------------------------
     @app.post("/hive/agent/ask")

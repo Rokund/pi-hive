@@ -135,6 +135,20 @@ legacy `/hive/subagent/glimpse` alias, which remains). The response carries
   FULL final text is only available from the WS `message_end` event or
   `subagent_result`'s `result.finalText`, never from a glimpse.
 
+### 2.6 Wait for an agent to settle (HTTP-only, no sleep loops)
+If you drive pi-hive over plain HTTP (no persistent WebSocket), do NOT
+sleep-poll `GET /api/agent/{id}` to detect that an agent finished its turn —
+use the long-poll `POST http://127.0.0.1:3001/hive/agent/wait` with body
+`{"id": "<agent_id>", "wait_time": <ms>}` (default 0 = return current state
+immediately). It works for primaries AND subagents: a settled or unloaded
+agent (idle/done/failed/aborted) returns its current node status + result
+payload at once (never waking or materializing it); a still-running agent
+blocks up to `wait_time` and returns the result the moment it settles, or
+`{ok:true, id, status:"running", progress:{...}}` with anti-stall signals
+(`recentlyActive`, `lastEventAgeMs`, `streaming`, `phase`, optional
+`liveOutputChars`/`usage`) if the bound elapses first. Re-issue the call on a
+`running` response to keep waiting. Unknown ids return `{ok:false, error}`.
+
 ---
 
 ## 3. Reading output (the event stream)

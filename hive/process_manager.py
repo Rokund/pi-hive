@@ -1246,6 +1246,72 @@ class ProcessManager:
                 return {"ok": True, "status": "running", "progress": self._progress(node_id)}
         return self._result_payload(st, node_id)
 
+    async def wait_for_agent(self, node_id: str, wait_time_ms: int = 0) -> Dict[str, Any]:
+        """Generic settle long-poll for ANY agent (primary or subagent) (#5).
+
+        Generalizes `get_subagent_result` so HTTP-only drivers can block up
+        to `wait_time_ms` for an agent's turn to finish instead of sleep-
+        polling `GET /api/agent/{id}`.  Reuses the existing state machinery
+        (`wait_for_terminal`, `_progress`, `_result_payload`) — no new polling
+        or sleeping server-side.
+
+        Semantics:
+          * unknown id            -> `{ok: False, error: "unknown agent id"}`
+          * already settled / not
+            loaded (reaped, idle,
+            done, failed, aborted)
+            -> immediate return with the current node status + result
+            payload; NEVER wakes or materializes the agent.
+          * running               -> await `st.wait_for_terminal(wait_time_ms)`:
+            settles within the bound -> result payload (early return, not a
+            full sleep); still running -> `{ok, id, status: "running",
+            progress: {...}}` via the existing `_progress()` signals.
+
+        Primaries settle to `idle` (subagents to `done`), so when a live
+        state settles here the response carries the graph NODE's status,
+        mirroring `get_agent_glimpse` (the node status is authoritative for
+        both kinds; the in-memory state only reliably distinguishes
+        terminal vs running).
+        """
+        st = self.get_state(node_id)
+        node = None
+        if self.graph is not None and self.graph.has_node(node_id):
+            node = self.graph.get_node(node_id)
+
+        if st is not None and st.status in ("done", "failed", "aborted"):
+            payload = self._result_payload(st, node_id)
+            payload["id"] = node_id
+            # Report the authoritative node status (settled primaries are
+            # "idle", not "done"), unless the node is still in a transient
+            # non-settled state lagging behind the state update.
+            if node is not None and node.status in ("done", "failed", "aborted", "idle"):
+                payload["status"] = node.status
+            return payload
+
+        if st is None:
+            if self.get(node_id) is not None:
+                # A process exists but no state record (degenerate); treat
+                # it as running rather than waking anything.
+                return {"ok": True, "id": node_id, "status": "running",
+                        "progress": self._progress(node_id)}
+            if node is not None:
+                # Known node with no live state in this hive process
+                # (reaped, or restored from disk after a restart): report
+                # its current status immediately — never spawn/wake.
+                return {"ok": True, "id": node_id, "status": node.status}
+            return {"ok": False, "error": f"unknown agent id: {node_id}"}
+
+        if wait_time_ms and wait_time_ms > 0:
+            terminal = await st.wait_for_terminal(wait_time_ms)
+            if not terminal or st.status == "running":
+                return {"ok": True, "id": node_id, "status": "running",
+                        "progress": self._progress(node_id)}
+        payload = self._result_payload(st, node_id)
+        payload["id"] = node_id
+        if node is not None and node.status in ("done", "failed", "aborted", "idle"):
+            payload["status"] = node.status
+        return payload
+
     def _progress(self, node_id: str) -> Dict[str, Any]:
         """Liveness/progress signals for a still-running subagent.
 
