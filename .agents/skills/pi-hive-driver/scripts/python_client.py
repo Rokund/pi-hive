@@ -14,22 +14,26 @@ plus Python's stdlib for everything else. No `requests`, no external constants.
 
 The `subagent_*` tools (spawn/result/abort/steer/followup/glimpse) are HTTP
 endpoints that the PRIMARY calls via its extension — a WS-only driver normally
-never touches them. The one exception documented here is `subagent_glimpse`
-(peek at a subagent's live output): it has NO WS command, only the HTTP endpoint
-`POST /hive/subagent/glimpse`, so the optional helper `HiveClient.subagent_glimpse()`
-below uses stdlib `urllib` to mirror the extension's exact call shape. It is
-purely optional — driving primaries over WS never needs it.
+never touches them. The one exception documented here is peeking at an agent's
+live output: it has NO WS command, only the HTTP endpoint
+`POST /hive/agent/glimpse`, so the optional helper `HiveClient.agent_glimpse()`
+below (alias `subagent_glimpse`) uses stdlib `urllib` to mirror the extension's
+exact call shape. It is purely optional — driving primaries over WS never
+needs it.
 
 Deltas vs final: `message_update` frames are streamed deltas; the authoritative
 final text of a turn is the assistant `message_end`. Completion is signaled by
 the `agent_settled` event (authoritative) or a node status of idle (primary) /
-done (subagent). Never treat `message_update` as a final answer.
+done (subagent). Never treat `message_update` as a final answer. A dropped
+connection aborts the drive with `HiveError` instead of spinning until the
+wall timeout.
 """
 from __future__ import annotations
 
 import json
 import time
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import websocket  # websocket-client  (pip install websocket-client)
 
@@ -71,15 +75,21 @@ class HiveClient:
 
     @staticmethod
     def _next_frame(ws: websocket.WebSocket):
-        """Read one JSON frame; returns parsed dict or None on timeout/close."""
+        """Read one JSON frame; returns the parsed dict or None on recv timeout.
+
+        None means "no frame arrived this poll" — callers may keep waiting. A
+        CLOSED connection raises `HiveError` instead, so a drive loop aborts
+        immediately rather than busy-spinning until its wall timeout. A frame
+        that is not valid JSON is skipped (data is flowing, so no spin risk).
+        """
         try:
             raw = ws.recv()
         except websocket.WebSocketTimeoutException:
             return None
-        except (websocket.WebSocketConnectionClosedException, ConnectionError):
-            return None
+        except (websocket.WebSocketConnectionClosedException, ConnectionError) as exc:
+            raise HiveError(f"connection closed: {exc}") from exc
         if not raw:
-            return None
+            raise HiveError("connection closed: empty frame")
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
@@ -132,11 +142,19 @@ class HiveClient:
           {agent_id, settled, status, final_text (last assistant answer),
            transcript [all assistant texts], tool_calls (deduped), frame_count,
            duration_s}
+
+        Completion is gated behind the response-ack barrier: settles and done
+        node snapshots read BEFORE the `{"type":"response","command":"prompt"}`
+        ack for OUR send belong to the previous turn and never complete this
+        drive; only signals observed after the ack may. A dropped connection
+        raises `HiveError` immediately; only recv timeouts are retried.
+
         Note: `settled` is the authoritative completion signal (backed by the
-        agent's `agent_settled` / done status). `status` is the LAST node
-        snapshot we happened to observe and may lag behind the settled signal
-        (e.g. still "running" right before an `agent_settled`), so gate on
-        `settled`, not `status`.
+        agent's `agent_settled` event or a done node snapshot). `status` comes
+        from the completing `agent_settled` payload (`{kind, status, terminal}`)
+        — or, when the settle event carried no payload, from the completing
+        node snapshot / last snapshot seen — so it no longer lags behind the
+        settle signal.
         """
         if not self.check_online():
             raise HiveError("pi-hive not reachable at " + self.ws_url)
@@ -147,12 +165,13 @@ class HiveClient:
         tool_calls: list[dict] = []
         seen_tool_keys: set = set()
         observed: dict[str, dict] = {}
-        settled_ids: set[str] = set()
         frames: list = []
 
         ws = self._connect()
         start = time.time()
         settled = False
+        settle_signal: Optional[dict] = None
+        acked = False
         try:
             payload: dict = {"type": "prompt", "text": prompt}
             if target:
@@ -164,19 +183,28 @@ class HiveClient:
             while time.time() - start < wall_timeout:
                 frame = self._next_frame(ws)
                 if frame is None:
+                    # Recv timeout only — a closed connection raises HiveError
+                    # in _next_frame instead of busy-spinning here.
                     continue
                 frames.append(frame)
                 if collect is not None:
                     collect.append(frame)
 
-                self._observe(frame, target, pre,
-                              observed, settled_ids, final_texts, tool_calls, seen_tool_keys)
+                # Response-ack barrier: our prompt is only live once the
+                # server has acked it on this socket.
+                if frame.get("type") == "response" and frame.get("command") == "prompt":
+                    acked = True
+
+                signal = self._observe(frame, target, observed,
+                                       final_texts, tool_calls, seen_tool_keys)
                 # Discover the freshly spawned primary if we asked for a new one.
                 if target is None:
                     target = self._discover_new_primary(frame, pre, target)
-                # Completion: authoritative settled signal, or done node status.
-                if target and (target in settled_ids or self._is_done(observed.get(target))):
+                # Completion: authoritative settled signal, or done node
+                # status — but only from frames read after our prompt's ack.
+                if acked and target and signal and signal.get("agent_id") == target:
                     settled = True
+                    settle_signal = signal
                     break
         finally:
             try:
@@ -184,10 +212,16 @@ class HiveClient:
             except Exception:
                 pass
 
+        status: Optional[str] = None
+        if settle_signal is not None:
+            status = settle_signal.get("status")
+        if status is None:
+            status = (observed.get(target) or {}).get("status")
+
         return {
             "agent_id": target,
             "settled": settled,
-            "status": (observed.get(target) or {}).get("status"),
+            "status": status,
             "final_text": final_texts[-1] if final_texts else "",
             "transcript": final_texts,
             "tool_calls": tool_calls,
@@ -230,22 +264,36 @@ class HiveClient:
                 return cid
         return None
 
-    def _observe(self, frame, target, pre, observed, settled_ids, final_texts,
-                 tool_calls, seen_tool_keys):
+    def _observe(self, frame, target, observed, final_texts,
+                 tool_calls, seen_tool_keys) -> Optional[dict]:
+        """Fold one frame into the running drive state.
+
+        Returns a settle-signal dict `{agent_id, status, kind, source}` when
+        THIS frame marks an agent settled or done — an `agent_settled` event
+        (carrying the hive-computed `settled: {kind, status, terminal}`
+        payload) or a node snapshot whose status is idle/done — else None.
+        The caller decides whether the signal completes the drive (same agent
+        as the target, and only after the prompt ack).
+        """
         t = frame.get("type")
         if t == "hive:agent_updated":
             ag = frame.get("agent") or {}
             if ag.get("id"):
-                observed[ag["id"]] = self._snapshot(ag)
-            return
+                snap = self._snapshot(ag)
+                observed[ag["id"]] = snap
+                if self._is_done(snap):
+                    return {"agent_id": ag["id"], "status": snap.get("status"),
+                            "kind": ag.get("kind"), "source": "snapshot"}
+            return None
         if t != "hive:event":
-            return
+            return None
         ev = frame.get("event") or {}
         aid = frame.get("agentId")
         etype = ev.get("type")
         if etype == "agent_settled" and aid:
-            settled_ids.add(aid)
-            return
+            s = ev.get("settled") or {}
+            return {"agent_id": aid, "status": s.get("status"),
+                    "kind": s.get("kind"), "source": "settled"}
         if etype == "message_end":
             # A subscriber socket carries events for EVERY agent. Only collect
             # the assistant's text when it belongs to our target, so other
@@ -255,13 +303,16 @@ class HiveClient:
                 if isinstance(msg, dict) and msg.get("role") == "assistant":
                     for b in self._block_texts(msg):
                         final_texts.append(b)
-            return
+            return None
         # Record each tool call exactly once (end frame), keyed by its id.
+        # The tool's name lives in `toolName`; `toolCallId` stays the dedupe key.
         if etype == "tool_execution_end" and aid and aid == target:
-            key = (aid, ev.get("toolCallId") or ev.get("id") or f"{aid}:{ev.get('name')}:{time.time()}")
+            name = ev.get("toolName") or ev.get("name")
+            key = (aid, ev.get("toolCallId") or ev.get("id") or f"{aid}:{name}:{time.time()}")
             if key not in seen_tool_keys:
                 seen_tool_keys.add(key)
-                tool_calls.append({"agentId": aid, "name": ev.get("name")})
+                tool_calls.append({"agentId": aid, "name": name})
+        return None
 
     @staticmethod
     def _block_texts(message: Optional[dict]) -> list[str]:
@@ -282,15 +333,22 @@ class HiveClient:
     # The glimpse endpoint is HTTP and exposed for ANY agent (primary or
     # subagent).  There is no WS command for a peek, so this optional helper
     # uses stdlib urllib (no third-party dependency).
+    def _http_base(self) -> str:
+        """HTTP API base derived from ws_url (same host/port; ws->http, wss->https)."""
+        parts = urlsplit(self.ws_url)
+        scheme = "https" if parts.scheme == "wss" else "http"
+        return f"{scheme}://{parts.netloc}"
+
     def agent_glimpse(
         self,
         agent_id: str,
         n: int = 1024,
-        api_base: str = "http://127.0.0.1:3001",
+        api_base: Optional[str] = None,
     ) -> dict:
         """Peek at the tail of ANY agent's live produced text (HTTP-only).
 
-        Works for both primaries and subagents.
+        Works for both primaries and subagents. `api_base` defaults to the HTTP
+        twin of `self.ws_url` (same host and port).
 
         Returns the hive payload: ``{ok, status, phase, complete, truncated,
         totalChars, text}`` (on transport/HTTP failure, ``{ok: False, error}``).
@@ -311,6 +369,8 @@ class HiveClient:
         """
         import urllib.request  # stdlib
 
+        if api_base is None:
+            api_base = self._http_base()
         url = f"{api_base}/hive/agent/glimpse"
         body = {"id": agent_id, "n": int(n)}
         req = urllib.request.Request(
@@ -325,8 +385,9 @@ class HiveClient:
         except Exception as exc:  # HTTPError / URLError / JSONDecodeError
             return {"ok": False, "error": f"agent_glimpse failed: {exc}"}
 
-    # Backward-compatible alias: keeps the old name working via the legacy
-    # /hive/subagent/glimpse route (which the server still serves as an alias).
+    # Backward-compatible alias for the old method name ONLY: both names call
+    # the canonical POST /hive/agent/glimpse endpoint (the legacy
+    # /hive/subagent/glimpse alias exists server-side, not here).
     subagent_glimpse = agent_glimpse
 
 
