@@ -28,8 +28,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from .agent_graph import AgentGraph, NodeNotFoundError
@@ -1057,11 +1055,22 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
         steered; any non-running addressee (settled/idle/unloaded) is woken
         with a follow-up prompt (lazy respawn from its persisted session).
         ``delivered`` is true when either path reached a process.
+
+        Deliberate trade-off (kept inline on purpose — it mirrors the
+        ``/hive/subagent/*`` route style and powers the truthful ``delivered``
+        field): question delivery is AWAITED before responding, so when the
+        addressee is not running the response latency includes the wake-path
+        respawn (lazy spawn + session reload), which can take seconds. The
+        spec's "returns the questionId immediately" (ADR-0001: async,
+        non-blocking ask) means non-blocking w.r.t. the ANSWER — the asker
+        never waits for a reply — not zero delivery latency.
         """
         question = (body.question or "").strip()
         if not question:
             return {"ok": False, "questionId": "", "error": "question text is empty"}
-        addressee, err = _qa_resolve_addressee(ctx, body.frm, body.to)
+        # Normalize an explicit empty-string `to` to an omitted one (upward),
+        # instead of failing with 'unknown agent: '.
+        addressee, err = _qa_resolve_addressee(ctx, body.frm, body.to or None)
         if err is not None or addressee is None:
             return {"ok": False, "questionId": "", "error": err or "question scope violation"}
 
@@ -1108,7 +1117,11 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
         delivered = await _qa_deliver_answer(
             ctx, asker, _qa_answer_message(body.questionId, body.frm, text)
         )
-        return {"ok": True, "questionId": body.questionId, "delivered": delivered}
+        # error:"" on success keeps the envelope shape aligned with
+        # /hive/agent/ask and /hive/subagent/spawn (callers may read
+        # body.error unconditionally).
+        return {"ok": True, "questionId": body.questionId,
+                "delivered": delivered, "error": ""}
 
     @app.post("/hive/agent/question_status")
     async def hive_agent_question_status(body: QuestionStatusIn) -> Dict[str, Any]:

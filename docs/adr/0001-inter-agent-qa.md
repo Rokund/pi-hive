@@ -12,7 +12,7 @@ hive-unique opaque `questionId` and accepts **exactly one** answer
 the asker via the existing steer channel when it is still running, or left
 for the asker to retrieve on its own schedule.
 
-Status: proposed
+Status: accepted
 
 Considered options
 
@@ -43,3 +43,7 @@ Consequences
 - Idle askers deliberately are not woken to receive answers; they must poll
   (`question_status` / `pending_questions`), so delivery is best-effort for
   running askers and pull-based for idle ones.
+- The Q&A store is in-memory only (v1): a hive restart drops open questions,
+  so `pending_questions` after a restart under-reports what an agent is owed.
+  Answered-record retention is bounded by the store itself; persistence can
+  be layered into `HiveState` later if open questions must survive restarts.

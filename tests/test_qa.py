@@ -235,6 +235,20 @@ def test_ask_upward_grandchild_resolves_its_own_parent():
     assert st["question"]["to"] == CHILD1  # its DIRECT parent, not the primary
 
 
+def test_empty_string_to_treated_as_upward():
+    # Regression: a body sending to:"" must be normalized to an OMITTED to
+    # (upward), not fail with 'unknown agent: ' — mirrors the omitted-to test.
+    client, _, _ = _client()
+    resp = client.post("/hive/agent/ask", json={
+        "from": CHILD1, "to": "", "question": "Empty to means upward?",
+    })
+    assert resp.json()["ok"] is True
+    qid = resp.json()["questionId"]
+    st = _status(client, CHILD1, qid).json()
+    assert st["question"]["to"] == PRIMARY  # resolved from parentId
+    assert st["question"]["from"] == CHILD1
+
+
 def test_ask_sibling_rejected():
     client, _, _ = _client()
     resp = _ask(client, CHILD1, "Sibling question?", to=CHILD2)
@@ -622,6 +636,25 @@ def test_frm_alias_accepted_instead_of_from():
     assert client.post("/hive/agent/pending_questions", json={
         "frm": PRIMARY,
     }).json()["ok"] is True
+
+
+def test_from_and_frm_both_present_from_wins():
+    # Contract pin: when a body carries BOTH keys, AliasChoices first-match
+    # deterministically picks the canonical wire key `from` (and `frm` is
+    # ignored as a leftover), never the other way around.
+    client, _, _ = _client()
+    qid = client.post("/hive/agent/ask", json={
+        "from": PRIMARY, "frm": CHILD2, "question": "Who is the asker?",
+        "to": CHILD1,
+    }).json()["questionId"]
+    # The asker is PRIMARY (from), NOT CHILD2 (frm).
+    st = _status(client, PRIMARY, qid).json()
+    assert st["ok"] is True
+    assert st["question"]["from"] == PRIMARY
+    # CHILD2 is neither asker nor addressee under this reading.
+    assert _status(client, CHILD2, qid).json()["ok"] is False
+    assert [q["id"] for q in _pending(client, PRIMARY).json()["questions"]] == [qid]
+    assert _pending(client, CHILD2).json()["questions"] == []
 
 
 def test_pending_questions_unknown_agent_rejected():

@@ -112,7 +112,7 @@ const SPAWN_DESCRIPTION = [
 	.filter(Boolean)
 	.join(" ");
 
-/** The parent agent's hive node id == pi session id (see hive/models.py). */
+/** THIS agent's own hive node id == pi session id (see hive/models.py). */
 function parentId(ctx: { sessionManager: { getSessionId(): string } }): string {
 	return ctx.sessionManager.getSessionId();
 }
@@ -544,12 +544,11 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: JSON.stringify({
-							ok: result.ok,
-							questionId: result.data?.questionId,
-							delivered: result.data?.delivered,
-							error: result.error ?? result.data?.error ?? undefined,
-						}),
+						text: JSON.stringify(
+							result.ok
+								? result.data
+								: { ok: false, error: result.error },
+						),
 					},
 				],
 				details: {},
@@ -609,13 +608,11 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: JSON.stringify({
-							ok: result.ok,
-							questionId: result.data?.questionId ?? params.questionId,
-							delivered: result.data?.delivered,
-							error: result.error ?? result.data?.error ?? undefined,
-							answer: result.data?.answer,
-						}),
+						text: JSON.stringify(
+							result.ok
+								? result.data
+								: { ok: false, error: result.error },
+						),
 					},
 				],
 				details: {},
