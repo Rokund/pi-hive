@@ -85,6 +85,14 @@ response path, including error responses.
 - No `agentId` → the hive spawns a fresh primary to run it. The new `id` shows
   up in the next `hive:agent_updated` / `hive:tree` frame.
 - `cwd` (optional absolute path) sets that primary's working directory.
+- **Spawn by profile:** an optional `"agent": "<profile-name>"` on a bare
+  prompt (no `agentId`) makes the fresh primary run THAT agent profile
+  instead of the configured `default_primary` — e.g.
+  `{ "type": "prompt", "text": "...", "agent": "coder2" }`. The profile must
+  exist and be primary-eligible, otherwise the command fails with a clear
+  error and NO node is created. When `agent` instead matches an EXISTING
+  node id it targets that conversation (the long-standing alias), so
+  profile-spawn only kicks in for names that are not node ids.
 
 ### 2.2 Continue / steer an existing agent
 ```json

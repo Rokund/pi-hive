@@ -545,18 +545,51 @@ async def _handle_command(
         # builds dicts from pydantic models).
         req_id = (payload or {}).get("reqId") if isinstance(payload, dict) else None
         if command in ("prompt", "steer", "follow_up"):
-            explicit = (payload or {}).get("agentId") or (payload or {}).get("agent")
-            if command == "prompt" and not explicit:
-                # A bare prompt over WS/HTTP starts a NEW conversation: spawn a
-                # fresh primary to carry it instead of piling onto the oldest
-                # root. (Explicit agent ids always target that agent.)
-                if ctx.spawn_primary is None:
-                    return _build_api_response(command, error="hive not wired",
-                                                req_id=req_id)
-                node = await ctx.spawn_primary(
-                    cwd=(payload or {}).get("cwd") or None
-                )
-                explicit = node.id
+            payload = payload or {}
+            agent_id = payload.get("agentId")
+            agent_field = payload.get("agent")
+            if command == "prompt" and not agent_id:
+                # A prompt without an explicit agentId never continues an
+                # existing conversation: it either spawns a NEW primary
+                # (instead of piling onto the oldest root) or, when `agent`
+                # names an existing node, targets that node (M2 alias).
+                if not agent_field:
+                    # Bare prompt: spawn a fresh DEFAULT primary to carry it.
+                    if ctx.spawn_primary is None:
+                        return _build_api_response(
+                            command, error="hive not wired", req_id=req_id)
+                    node = await ctx.spawn_primary(
+                        cwd=payload.get("cwd") or None
+                    )
+                    explicit = node.id
+                elif ctx.graph.has_node(agent_field):
+                    # `agent` names an EXISTING node -> target it.
+                    explicit = agent_field
+                else:
+                    # `agent` names an agent PROFILE -> spawn a NEW primary
+                    # running that profile instead of `default_primary`
+                    # (WS spawn-by-profile, issue #7). start_primary
+                    # validates the profile (must exist and be
+                    # primary-eligible) and raises BEFORE any node is
+                    # created, so an unknown/ineligible name leaves the
+                    # tree untouched.
+                    if ctx.spawn_primary is None:
+                        return _build_api_response(
+                            command, error="hive not wired", req_id=req_id)
+                    try:
+                        node = await ctx.spawn_primary(
+                            agent=agent_field,
+                            cwd=payload.get("cwd") or None,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        return _build_api_response(
+                            command, error=str(exc), req_id=req_id)
+                    explicit = node.id
+            else:
+                # steer / follow_up, or a prompt carrying an explicit
+                # agentId: `agent` stays the node-id alias (agentId wins
+                # when both are present).
+                explicit = agent_id or agent_field
             agent = explicit or ctx.graph.latest_primary_id()
             if not agent:
                 return _build_api_response(
