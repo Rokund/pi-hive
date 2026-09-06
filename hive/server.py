@@ -336,14 +336,26 @@ def _wrap_event(agent_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_api_response(command: str, payload: Dict[str, Any] | None = None,
-                        error: Optional[str] = None) -> Dict[str, Any]:
-    return {
+                        error: Optional[str] = None,
+                        req_id: Any = None) -> Dict[str, Any]:
+    """Build a `{type:"response"}` frame.
+
+    ``req_id`` (issue #6) is echoed VERBATIM as the frame's ``reqId`` key when
+    it was present on the incoming command; when absent the key is OMITTED
+    entirely so frames stay byte-compatible with pre-#6 clients.
+    """
+    resp: Dict[str, Any] = {
         "type": "response",
         "command": command,
         "success": error is None,
-        **({"data": payload} if payload is not None else {}),
-        **({"error": error} if error is not None else {}),
     }
+    if req_id is not None:
+        resp["reqId"] = req_id
+    if payload is not None:
+        resp["data"] = payload
+    if error is not None:
+        resp["error"] = error
+    return resp
 
 
 def _resolve_agent(ctx: ApiContext, payload: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -520,8 +532,18 @@ async def _handle_command(
     command: str,
     payload: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Dispatch one Hive API command and return a response dict."""
+    """Dispatch one Hive API command and return a response dict.
+
+    A command may carry an optional ``reqId`` (string or number, issue #6);
+    it is echoed back verbatim on the response frame so a driver can match
+    responses to requests instead of relying on ordering. Absent ``reqId``
+    leaves the key off the frame entirely (byte-compatible).
+    """
     try:
+        # (payload or {}).get: HTTP routes may pass None; a non-dict payload is
+        # impossible on either transport (WS checks isinstance(dict), HTTP
+        # builds dicts from pydantic models).
+        req_id = (payload or {}).get("reqId") if isinstance(payload, dict) else None
         if command in ("prompt", "steer", "follow_up"):
             explicit = (payload or {}).get("agentId") or (payload or {}).get("agent")
             if command == "prompt" and not explicit:
@@ -529,16 +551,22 @@ async def _handle_command(
                 # fresh primary to carry it instead of piling onto the oldest
                 # root. (Explicit agent ids always target that agent.)
                 if ctx.spawn_primary is None:
-                    return _build_api_response(command, error="hive not wired")
+                    return _build_api_response(command, error="hive not wired",
+                                                req_id=req_id)
                 node = await ctx.spawn_primary(
                     cwd=(payload or {}).get("cwd") or None
                 )
                 explicit = node.id
             agent = explicit or ctx.graph.latest_primary_id()
             if not agent:
-                return _build_api_response(command, error="no agent id given and no primary agent")
+                return _build_api_response(
+                    command, error="no agent id given and no primary agent",
+                    req_id=req_id
+                )
             if not ctx.graph.has_node(agent):
-                return _build_api_response(command, error=f"agent not found: {agent}")
+                return _build_api_response(
+                    command, error=f"agent not found: {agent}", req_id=req_id
+                )
             # Lazily materialize a persisted-but-unloaded conversation so the
             # prompt/steer reaches a live process (lazy load on open). This is
             # a cheap no-op for already-spawned agents.
@@ -562,12 +590,15 @@ async def _handle_command(
                     rpc_cmd["streamingBehavior"] = "steer"
 
             await ctx.processes.send_command(agent, rpc_cmd)
-            return _build_api_response(command)
+            return _build_api_response(command, req_id=req_id)
 
         if command == "abort":
             agent = _resolve_agent(ctx, payload)
             if not agent:
-                return _build_api_response("abort", error="no agent id given and no primary agent")
+                return _build_api_response(
+                    "abort", error="no agent id given and no primary agent",
+                    req_id=req_id
+                )
             node = ctx.graph.get_node(agent) if ctx.graph.has_node(agent) else None
             # SPEC §7: abort on a done/idle/aborted/failed node is a no-op.
             if node and node.status not in ("done", "idle", "aborted", "failed"):
@@ -583,12 +614,12 @@ async def _handle_command(
                     "agent": ctx.graph.get_node(agent).model_dump(mode="json"),
                     "ts": int(time.time() * 1000),
                 })
-            return _build_api_response("abort")
+            return _build_api_response("abort", req_id=req_id)
 
         if command == "get_tree":
             nodes = ctx.graph.get_tree()
             tree = [n.model_dump(mode="json") for n in nodes]
-            return _build_api_response("get_tree", {"tree": tree})
+            return _build_api_response("get_tree", {"tree": tree}, req_id=req_id)
 
         if command == "get_agent":
             agent = payload.get("agent") if payload else None
@@ -596,19 +627,21 @@ async def _handle_command(
                 raise ValueError("agent is required")
             node = ctx.graph.get_node(agent)
             return _build_api_response(
-                "get_agent", node.model_dump(mode="json")
+                "get_agent", node.model_dump(mode="json"), req_id=req_id
             )
 
         if command == "subscribe":
             # Subscribe happens over the WS connection itself; nothing to do here.
-            return _build_api_response("subscribe")
+            return _build_api_response("subscribe", req_id=req_id)
 
-        return _build_api_response(command, error=f"unknown command: {command}")
+        return _build_api_response(command, error=f"unknown command: {command}",
+                                   req_id=req_id)
     except NodeNotFoundError as exc:
-        return _build_api_response(command, error=f"agent not found: {exc}")
+        return _build_api_response(command, error=f"agent not found: {exc}",
+                                   req_id=req_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("command %s failed", command)
-        return _build_api_response(command, error=str(exc))
+        return _build_api_response(command, error=str(exc), req_id=req_id)
 
 
 # ---------------------------------------------------------------------------

@@ -69,6 +69,15 @@ Every message you send is a JSON object with a `type`. The hive answers with
 `{type:"response", command:..., success:...}` and, in parallel, pushes
 broadcast event frames on the same socket.
 
+**Correlation (`reqId`, recommended):** every command may carry an optional
+`"reqId": "<string or number>"`. The response frame echoes it back verbatim
+(`reqId` in the `{type:"response"}` object) and omits the key entirely when
+you didn't send one. Send a **unique `reqId` per command and match
+responses to requests by `reqId`, never by arrival order** — commands may
+complete out of order (e.g. concurrent prompts of different duration), so
+order-based matching is unreliable. This covers every command on every
+response path, including error responses.
+
 ### 2.1 Spawn a new conversation with a task
 ```json
 { "type": "prompt", "text": "Investigate the height of the Eiffel Tower and reply briefly." }
