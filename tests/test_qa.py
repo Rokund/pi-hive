@@ -87,19 +87,31 @@ def _tree() -> AgentGraph:
 class FakeProcessManager:
     """Duck-typed ProcessManager: records every outbound delivery attempt.
 
-    ``live`` holds the ids of agents considered to have a live process
-    (``get`` returns a truthy sentinel for them, None otherwise — the exact
-    liveness proxy the real ProcessManager exposes).
+    Three INDEPENDENT liveness dimensions, mirroring the real manager (where
+    they are genuinely decoupled — the e2e bug was exactly a confusion of the
+    first two):
+
+    * ``live``      — ids with a live process (``get`` returns a truthy
+      sentinel). A done/idle agent stays here until the idle reaper collects
+      it, so "process present" does NOT mean "running";
+    * ``streaming`` — ids currently mid-turn at the event layer
+      (``is_streaming``), which can disagree (lead) the node status;
+    * node status   — owned by the graph, set via ``running``/direct
+      ``graph.update_node`` in the tests.
     """
 
-    def __init__(self, live: Iterable[str] = ()) -> None:
+    def __init__(self, live: Iterable[str] = (), streaming: Iterable[str] = ()) -> None:
         self.live = set(live)
+        self.streaming = set(streaming)
         self.send_command_calls: List[Dict[str, Any]] = []
         self.send_calls: List[Dict[str, Any]] = []
         self.followups: List[Dict[str, Any]] = []
 
     def get(self, node_id: str) -> Optional[object]:
         return object() if node_id in self.live else None
+
+    def is_streaming(self, node_id: str) -> bool:
+        return node_id in self.streaming
 
     async def send_command(self, agent_id: str, cmd: Dict[str, Any]) -> None:
         self.send_command_calls.append({"agent": agent_id, "cmd": cmd})
@@ -118,9 +130,15 @@ def _client(
     processes: Optional[FakeProcessManager] = None,
     qa: Optional[QuestionStore] = None,
     live: Iterable[str] = (),
+    running: Iterable[str] = (),
+    streaming: Iterable[str] = (),
 ):
     graph = graph if graph is not None else _tree()
-    processes = processes if processes is not None else FakeProcessManager(live=live)
+    for nid in running:  # model mid-turn agents (node status side)
+        graph.update_node(nid, status="running")
+    processes = processes if processes is not None else FakeProcessManager(
+        live=live, streaming=streaming
+    )
     ctx = ApiContext(
         graph=graph,
         processes=processes,  # type: ignore[arg-type]
@@ -349,7 +367,7 @@ def test_pending_questions_lists_only_askers_pending():
 # (d) delivery
 # ---------------------------------------------------------------------------
 def test_running_asker_gets_steer_containing_question_id():
-    client, _, pm = _client(live=(PRIMARY, CHILD1))
+    client, _, pm = _client(live=(PRIMARY, CHILD1), running=(PRIMARY, CHILD1))
     qid = _ask(client, PRIMARY, "Tell me the answer to everything", to=CHILD1).json()["questionId"]
     _answer(client, CHILD1, qid, "42")
 
@@ -393,7 +411,7 @@ def test_idle_addressee_is_woken_with_prompt():
 
 
 def test_running_addressee_gets_steer_with_question_id():
-    client, _, pm = _client(live=(CHILD1,))
+    client, _, pm = _client(live=(CHILD1,), running=(CHILD1,))
     qid = _ask(client, PRIMARY, "While you run, please answer", to=CHILD1).json()["questionId"]
 
     steers = _steers_for(pm, CHILD1)
@@ -403,8 +421,73 @@ def test_running_addressee_gets_steer_with_question_id():
     assert "agent_answer" in msg
     assert "While you run, please answer" in msg
     assert PRIMARY in msg  # the asker is identified
-    # A live addressee is never woken via the follow-up path.
+    # A mid-turn addressee is never woken via the follow-up path.
     assert pm.followups == []
+
+
+# ---------------------------------------------------------------------------
+# (d2) run-state-based delivery (e2e regression: settled-but-loaded agents)
+# ---------------------------------------------------------------------------
+def test_done_but_loaded_addressee_gets_wake_not_steer():
+    # THE e2e bug: the child finished its task (node status done) but its
+    # process is still loaded (not yet reaped). A process existing is NOT a
+    # run state — pi silently DROPS a steer sent to an agent with no live
+    # turn, losing the question. Such an addressee must be WOKEN instead.
+    client, ctx, pm = _client(live=(CHILD1,))
+    ctx.graph.update_node(CHILD1, status="done")  # settled, process loaded
+    assert not pm.is_streaming(CHILD1)
+
+    resp = _ask(client, PRIMARY, "Settled but loaded, please answer", to=CHILD1)
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["delivered"] is True  # via the wake path, truthfully reported
+
+    # No steer may be attempted against the settled process.
+    assert _steers_for(pm, CHILD1) == []
+    assert all(e["agent"] != CHILD1 for e in pm.send_command_calls)
+    # The wake path delivered a prompt carrying the questionId.
+    wakes = [e for e in pm.followups if e["agent"] == CHILD1]
+    assert len(wakes) == 1
+    assert body["questionId"] in wakes[0]["prompt"]
+    assert "agent_answer" in wakes[0]["prompt"]
+
+
+def test_streaming_addressee_gets_steer_even_when_node_status_lags():
+    # Mid-turn decided by EITHER signal: the event-layer is_streaming flag
+    # can lead the graph node status (status not yet flipped to running),
+    # and the question must still be steered, not treated as a wake case.
+    client, _, pm = _client(live=(CHILD1,), streaming=(CHILD1,))
+    qid = _ask(client, PRIMARY, "Streaming with lagging status?", to=CHILD1).json()["questionId"]
+
+    steers = _steers_for(pm, CHILD1)
+    assert len(steers) == 1
+    assert qid in steers[0]["cmd"]["message"]
+    assert pm.followups == []
+
+
+def test_answer_to_done_but_loaded_asker_recorded_not_delivered():
+    # Mirror of the e2e bug for answers: the asker settled (done) but its
+    # process is still loaded. The answer must be RECORDED (retrievable via
+    # question_status) but NOT delivered — no steer (it would be silently
+    # dropped) and no wake (idle askers are never woken, ADR-0001).
+    client, ctx, pm = _client(live=(PRIMARY, CHILD1))
+    ctx.graph.update_node(PRIMARY, status="done")
+    qid = _ask(client, PRIMARY, "Will you remember?", to=CHILD1).json()["questionId"]
+    pm.send_command_calls.clear()
+    pm.followups.clear()
+
+    resp = _answer(client, CHILD1, qid, "the late answer")
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["delivered"] is False  # truthful: nothing reached the asker
+    assert all(e["agent"] != PRIMARY for e in pm.send_command_calls)
+    assert pm.followups == []
+    assert all(e["agent"] != PRIMARY for e in pm.send_calls)
+
+    # The answer is nonetheless durably recorded for pull-based retrieval.
+    st = _status(client, PRIMARY, qid).json()
+    assert st["question"]["status"] == "answered"
+    assert st["question"]["answer"] == "the late answer"
 
 
 # ---------------------------------------------------------------------------
@@ -447,10 +530,11 @@ def test_store_prune_keeps_at_least_the_cap_when_idle():
 # (d) delivery — failure paths
 # ---------------------------------------------------------------------------
 def test_steer_failure_falls_back_to_wake_path():
-    # Addressee HAS a live process but its steer fails: _qa_deliver_question
-    # must fall back to the wake (followup) path and still report delivered.
+    # Addressee is MID-TURN with a live process but its steer fails:
+    # _qa_deliver_question must fall back to the wake (followup) path and
+    # still report delivered.
     pm = FlakyProcessManager(live=(CHILD1,), steer_raise=True)
-    client, _, pm = _client(processes=pm)
+    client, _, pm = _client(processes=pm, running=(CHILD1,))
     body = _ask(client, PRIMARY, "Fallback?", to=CHILD1).json()
     assert body["ok"] is True
     assert body["delivered"] is True
@@ -494,7 +578,10 @@ def test_answer_delivered_false_when_asker_process_gone():
 
 
 def test_answer_delivered_true_when_asker_running():
-    client, _, _ = _client(live=(PRIMARY, CHILD1))
+    # "Running" means run state (node status running / streaming), not just
+    # a loaded process — see the e2e regression: a settled-but-loaded asker
+    # must NOT be steered.
+    client, _, _ = _client(live=(PRIMARY, CHILD1), running=(PRIMARY,))
     qid = _ask(client, PRIMARY, "Q", to=CHILD1).json()["questionId"]
     body = _answer(client, CHILD1, qid, "a").json()
     assert body["ok"] is True
@@ -502,10 +589,10 @@ def test_answer_delivered_true_when_asker_running():
 
 
 def test_answer_steer_failure_still_records_answer():
-    # Running asker whose steer injection fails: the answer is still
+    # Mid-turn asker whose steer injection fails: the answer is still
     # recorded (exactly-once stands) and just reported undelivered.
     pm = FlakyProcessManager(live=(PRIMARY, CHILD1), steer_raise=True)
-    client, _, pm = _client(processes=pm)
+    client, _, pm = _client(processes=pm, running=(PRIMARY,))
     qid = _ask(client, PRIMARY, "Q", to=CHILD1).json()["questionId"]
     body = _answer(client, CHILD1, qid, "recorded anyway").json()
     assert body["ok"] is True

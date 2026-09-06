@@ -424,26 +424,53 @@ def _qa_resolve_addressee(ctx: ApiContext, frm: str, to: Optional[str]) -> Tuple
     return to, None
 
 
+def _qa_target_mid_turn(ctx: ApiContext, agent_id: str) -> bool:
+    """True when the agent has a live process AND is actually mid-turn.
+
+    Process existence is NOT run state (e2e regression): a done/idle agent
+    keeps its process until the idle reaper collects it, but pi silently
+    DROPS a steer sent to an agent with no live turn — the question/answer
+    is lost. Mid-turn therefore requires BOTH:
+
+      * ``processes.get(agent_id)`` — a process to steer into, AND
+      * ``processes.is_streaming(agent_id)`` OR graph node ``status ==
+        "running"`` — an actual live turn (either signal alone suffices:
+        the event-layer streaming flag leads the node status, which is
+        updated by an async event path and can lag).
+    """
+    if ctx.processes.get(agent_id) is None:
+        return False
+    if ctx.processes.is_streaming(agent_id):
+        return True
+    node = ctx.graph.get_node(agent_id) if ctx.graph.has_node(agent_id) else None
+    return node is not None and node.status == "running"
+
+
 async def _qa_deliver_question(ctx: ApiContext, addressee: str, message: str) -> bool:
     """Deliver a question to its addressee (best-effort, never blocking).
 
-    * Live process  -> RPC ``steer``: the question is queued and delivered
+    * Mid-turn agent -> RPC ``steer``: the question is queued and delivered
       after the addressee's current tool calls, before its next model call
       (the same channel ``steer_subagent`` uses — an in-flight agent is
-      redirected, not restarted).
-    * Idle/unloaded -> wake it with a follow-up prompt via
-      ``process_manager.followup_subagent``. That one call is the whole
-      existing lazy-load machinery: it respawns the agent from its persisted
-      ``--session`` file when the process was reaped, resets the subagent
-      result/state bookkeeping so a later ``subagent_result`` poll describes
-      the new turn, flips the node back to running, and finally delivers the
-      prompt. It works for primaries and subagents alike, and reusing it here
-      avoids duplicating the ensure_loaded + prompt wiring route-side.
+      redirected, not restarted). Decided by RUN STATE
+      (``_qa_target_mid_turn``), never by mere process existence: a settled
+      agent with a still-loaded process would silently drop the steer.
+    * Anything else (done/idle/failed/aborted, loaded or not) -> wake it
+      with a follow-up prompt via ``process_manager.followup_subagent``.
+      That one call is the whole existing lazy-load machinery: it respawns
+      the agent from its persisted ``--session`` file when the process was
+      reaped, resets the subagent result/state bookkeeping so a later
+      ``subagent_result`` poll describes the new turn, flips the node back
+      to running, and finally delivers the prompt. It works for primaries
+      and subagents alike, and reusing it here avoids duplicating the
+      ensure_loaded + prompt wiring route-side.
 
-    Returns True when the message reached a process. When delivery fails
-    entirely the question stays pending in the store (pull-based retrieval).
+    Returns True when the message reached a process (steered into a
+    mid-turn agent, or delivered via the wake path). When delivery fails
+    entirely the question stays pending in the store (pull-based
+    retrieval).
     """
-    if ctx.processes.get(addressee) is not None:
+    if _qa_target_mid_turn(ctx, addressee):
         try:
             await ctx.processes.send_command(
                 addressee, {"type": "steer", "message": message}
@@ -460,14 +487,19 @@ async def _qa_deliver_question(ctx: ApiContext, addressee: str, message: str) ->
 
 
 async def _qa_deliver_answer(ctx: ApiContext, asker: str, message: str) -> bool:
-    """Deliver an answer to the asker; NEVER wake an idle asker (ADR-0001).
+    """Deliver an answer to the asker; NEVER wake a non-running asker (ADR-0001).
 
-    A still-RUNNING asker gets the answer steer-injected (tagged with the
-    questionId) so its in-flight turn can use it. An asker that already
-    settled keeps its schedule: the answer stays in the store for retrieval
-    via ``question_status`` / ``pending_questions``.
+    Only a mid-turn asker (``_qa_target_mid_turn`` — run state, not process
+    existence: a settled asker with a still-loaded process would silently
+    drop the steer) gets the answer steer-injected, tagged with the
+    questionId, so its in-flight turn can use it. Anything else — settled,
+    idle, reaped — keeps its schedule: the answer stays in the store for
+    retrieval via ``question_status`` / ``pending_questions``.
+
+    Returns True only when the answer was actually injected; False means it
+    was recorded and left in the store (pull-based retrieval).
     """
-    if ctx.processes.get(asker) is None:
+    if not _qa_target_mid_turn(ctx, asker):
         return False
     try:
         await ctx.processes.send_command(asker, {"type": "steer", "message": message})
@@ -1017,11 +1049,14 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
         ``agent_allowlist`` does not participate in Q&A addressing.
 
         Async by design (ADR-0001): the questionId is returned immediately;
-        the answer arrives later via steer injection (running asker) or is
+        the answer arrives later via steer injection (mid-turn asker) or is
         retrieved via ``question_status`` / ``pending_questions``.
-        Delivery of the QUESTION to the addressee is best-effort: a live
-        process is steered; an idle/unloaded addressee is woken with a
-        follow-up prompt (lazy respawn from its persisted session).
+        Delivery of the QUESTION to the addressee is best-effort, decided by
+        RUN STATE (never by mere process existence — a settled agent with a
+        still-loaded process silently drops steers): a mid-turn addressee is
+        steered; any non-running addressee (settled/idle/unloaded) is woken
+        with a follow-up prompt (lazy respawn from its persisted session).
+        ``delivered`` is true when either path reached a process.
         """
         question = (body.question or "").strip()
         if not question:
@@ -1044,8 +1079,11 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
         ``from`` must equal the question's addressee. The first answer is
         permanent: a later answer is rejected with the existing answer handed
         back. On the first answer the asker is notified via steer injection
-        when its process is live; an idle asker is deliberately NOT woken
-        (ADR-0001) — the answer stays in the store for pull-based retrieval.
+        only when it is actually MID-TURN (run state, not process existence —
+        a settled asker with a still-loaded process would silently drop the
+        steer); a non-running asker is deliberately NOT woken (ADR-0001) —
+        the answer stays in the store for pull-based retrieval, reported
+        truthfully as ``delivered: false``.
         """
         text = (body.text or "").strip()
         if not text:
