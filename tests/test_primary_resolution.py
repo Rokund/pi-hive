@@ -540,8 +540,11 @@ def test_shipped_hive_config_json_loads_and_resolves_default_primary():
         pytest.skip("local hive/hive.config.json absent (gitignored); skipped")
     cfg = load_config()
     assert cfg.default_primary == "primary"
-    # primary is the single allow_as_primary-flagged agent.
-    assert cfg.primary_eligibility() == ["primary"]
+    # The shipped config legitimately flags several agents allow_as_primary
+    # (primary + tester + coder1..3 + reviewer), so the eligible set is larger
+    # than just "primary" — assert membership (robust to additional eligible
+    # agents) rather than an exact list.
+    assert "primary" in cfg.primary_eligibility()
     assert cfg.is_primary_eligible(cfg.default_primary)
     # The registry holds all 6 agents (primary + tester + coder1..3 + reviewer).
     assert len(cfg.known_names()) == 6

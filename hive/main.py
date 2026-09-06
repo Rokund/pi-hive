@@ -23,6 +23,7 @@ from .agent_graph import AgentGraph
 from .config import HiveConfig, load_config
 from .models import AgentNode
 from .process_manager import ProcessManager
+from .qa import QuestionStore
 from .server import ApiContext, EventBroadcaster, create_api_app, create_gui_app, _wrap_event
 from .state import HiveState
 
@@ -50,6 +51,10 @@ class Hive:
         self.state = HiveState().load()
         self.graph = AgentGraph()
         self.broadcaster = EventBroadcaster()
+        # Inter-agent Q&A store (ADR-0001): questions/answers between agents
+        # sharing a direct parent/child edge in one conversation. In-memory
+        # only — answered records are pruned boundedly by the store itself.
+        self.qa = QuestionStore()
         self.processes = ProcessManager(
             on_event=self._on_event,
             config=config,
@@ -61,6 +66,7 @@ class Hive:
             processes=self.processes,
             config=config,
             broadcaster=self.broadcaster,
+            qa=self.qa,
         )
         # Let the API layer create new primary conversations on demand.
         self.api_context.spawn_primary = self.start_primary

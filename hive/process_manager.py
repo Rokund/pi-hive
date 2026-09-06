@@ -54,6 +54,16 @@ EXTENSION_SUBAGENT = str(Path(__file__).resolve().parent / "extensions" / "subag
 # do NOT get the subagent tools; ["*"] means allow-all.
 SUBAGENT_TOOLS = ("subagent_spawn", "subagent_result", "subagent_abort", "subagent_followup", "subagent_steer", "subagent_glimpse")
 
+# Inter-agent Q&A tools (ADR-0001).  EVERY agent participates in Q&A with its
+# direct parent/children — the spawn `agent_allowlist` is a by-name spawn gate
+# and deliberately does NOT participate in Q&A addressing — so these names
+# merge into the `--tools` CSV for EVERY agent with a concrete (non-"*")
+# tools list, regardless of agent_allowlist.  Unlike SUBAGENT_TOOLS above
+# (merged only when agent_allowlist is non-empty), the Q&A merge is
+# unconditional.  "*" profiles are unaffected: they pass no `--tools` at all
+# and pi keeps every tool (QA included) visible.
+QA_TOOLS = ("agent_ask", "agent_answer", "question_status", "pending_questions")
+
 # Standard locations searched when resolving a configured skill NAME into a
 # real directory path that pi will accept (`--skill <path>`). pi does not
 # resolve names — it requires an existing path — so the hive maps them.
@@ -258,7 +268,10 @@ def build_rpc_args(profile: AgentProfile, node_id: str, session_file: Optional[s
     subagent tools are merged into the `--tools` allowlist for any agent with
     a non-empty `agent_allowlist` (including the primary), so nesting (M5)
     does not silently break: extension-registered tools are gated behind
-    `--tools`.
+    `--tools`.  The inter-agent Q&A tools (ADR-0001) are merged for EVERY
+    agent with a concrete (non-"*") tools list — independent of
+    `agent_allowlist` — because Q&A addressing is by direct parent/child
+    relation, not by spawn permissions.
     """
     args: List[str] = ["--mode", "rpc"]
 
@@ -281,6 +294,12 @@ def build_rpc_args(profile: AgentProfile, node_id: str, session_file: Optional[s
             for tool in SUBAGENT_TOOLS:
                 if tool not in tools:
                     tools.append(tool)
+        # Inter-agent Q&A (ADR-0001): merged for EVERY agent — the Q&A channel
+        # spans direct parent/child relations regardless of spawn permissions,
+        # so even a deny-all-spawning leaf gets to ask/answer its parent.
+        for tool in QA_TOOLS:
+            if tool not in tools:
+                tools.append(tool)
         # MCP visibility (ADR-0002): merge the concrete tool names for every
         # allowed MCP server (the stable "mcp__<server>" namespace proxy) plus
         # the mcp/mcpScript gateway helpers into the allowlist. pi gates

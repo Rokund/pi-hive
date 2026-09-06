@@ -5,7 +5,10 @@ Two servers (run concurrently by `hive.main`):
 * Port 1 (GUI):   WebSocket at `/ws`. Forwards every pi RPC event as
   ``{"type":"hive:event","agentId":...,"ts":...,"event":{...}}``.
 * Port 2 (API):   HTTP + WebSocket (Prompt/Steer API). Accepts
-  `prompt`, `steer`, `follow_up`, `abort`, `get_tree`, `get_agent`, `subscribe`.
+  `prompt`, `steer`, `follow_up`, `abort`, `get_tree`, `get_agent`, `subscribe`
+  plus the `/hive/subagent/*` orchestration routes and the `/hive/agent/*`
+  inter-agent Q&A routes (`ask`, `answer`, `question_status`,
+  `pending_questions` — ADR-0001).
 
 Transport only — all state lives in the graph / process manager supplied via
 `ApiContext`.
@@ -19,7 +22,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,9 +30,12 @@ from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+
 from .agent_graph import AgentGraph, NodeNotFoundError
 from .config import HiveConfig
 from .process_manager import ProcessManager
+from .qa import QuestionStore
 
 logger = logging.getLogger("hive.server")
 
@@ -142,11 +148,17 @@ class ApiContext:
         config: HiveConfig,
         broadcaster: EventBroadcaster,
         spawn_primary: Optional[Any] = None,
+        qa: Optional[QuestionStore] = None,
     ) -> None:
         self.graph = graph
         self.processes = processes
         self.config = config
         self.broadcaster = broadcaster
+        # Inter-agent Q&A store (ADR-0001): questions/answers between agents
+        # sharing a direct parent/child edge in one conversation. Hive wires
+        # its own instance so the store is shared by every route; a context
+        # built without one (tests, embedded use) gets a fresh in-memory store.
+        self.qa: QuestionStore = qa if qa is not None else QuestionStore()
         # Async callable () -> AgentNode, wired by Hive.__init__; lets the
         # API start a new primary conversation (new tree root) on demand.
         self.spawn_primary = spawn_primary
@@ -263,6 +275,51 @@ class AgentGlimpseIn(BaseModel):
     n: int = 1024
 
 
+# -- inter-agent Q&A (ADR-0001 / issue #4) ---------------------------------
+# Wire bodies use the JSON keys {from, to, questionId, ...}; `from` is a
+# reserved Python word, so the models accept it via an alias.
+class AgentAskIn(BaseModel):
+    """POST /hive/agent/ask — pose a question to a direct child (``to``
+    given) or to own parent (``to`` omitted; the hive resolves the asker's
+    parentId)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    frm: str = Field(validation_alias=AliasChoices("from", "frm"))
+    to: Optional[str] = None
+    question: str
+
+
+class AgentAnswerIn(BaseModel):
+    """POST /hive/agent/answer — the addressee supplies THE answer for a
+    questionId (exactly-once; the first answer stands)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    frm: str = Field(validation_alias=AliasChoices("from", "frm"))
+    questionId: str
+    text: str
+
+
+class QuestionStatusIn(BaseModel):
+    """POST /hive/agent/question_status — asker or addressee fetches one
+    question record (the pull path for idle agents)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    frm: str = Field(validation_alias=AliasChoices("from", "frm"))
+    questionId: str
+
+
+class PendingQuestionsIn(BaseModel):
+    """POST /hive/agent/pending_questions — the answers this agent is owed
+    (questions it asked that are still pending)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    frm: str = Field(validation_alias=AliasChoices("from", "frm"))
+
+
 def _wrap_event(agent_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "type": "hive:event",
@@ -303,6 +360,121 @@ def _command_message(payload: Optional[Dict[str, Any]]) -> str:
     if not payload:
         return ""
     return payload.get("text") or payload.get("message") or ""
+
+
+# ---------------------------------------------------------------------------
+# Inter-agent Q&A helpers (ADR-0001 / issue #4)
+# ---------------------------------------------------------------------------
+def _qa_question_message(question_id: str, asker: str, question: str) -> str:
+    """Format the message injected into the ADDRESSEE of a question.
+
+    Must unambiguously carry the questionId (the answer correlation key), the
+    asker's id, the question text, and how to reply (agent_answer with that
+    questionId) so the addressee can produce a correctly-keyed answer.
+    """
+    return (
+        f"[QUESTION questionId={question_id} from={asker}]\n"
+        f"{question}\n"
+        f"Reply using the agent_answer tool with questionId={question_id}."
+    )
+
+
+def _qa_answer_message(question_id: str, answerer: str, answer: str) -> str:
+    """Format the message injected into the ASKER of an answered question."""
+    return (
+        f"[ANSWER questionId={question_id} from={answerer}]\n"
+        f"{answer}"
+    )
+
+
+def _qa_resolve_addressee(ctx: ApiContext, frm: str, to: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Validate Q&A scope against the graph; return (addressee, error).
+
+    Scope (ADR-0001): a question may only flow along a DIRECT parent/child
+    edge within one conversation. Siblings, cross-level pairs (e.g.
+    grandparent/grandchild) and unknown ids are rejected. The upward
+    direction is addressed relationally (``to`` omitted -> the asker's
+    parentId); the downward direction by explicit child id. The
+    agent_allowlist never participates in Q&A addressing.
+    """
+    if not ctx.graph.has_node(frm):
+        return None, f"unknown agent: {frm}"
+    if to is None:
+        # Upward: only a subagent (an agent WITH a parent) may ask upward.
+        node = ctx.graph.get_node(frm)
+        if node.parentId is None:
+            return None, (
+                f"agent {frm} has no parent; upward questions (no 'to') are "
+                f"only valid for subagents"
+            )
+        if not ctx.graph.has_node(node.parentId):
+            return None, f"parent of {frm} not found: {node.parentId}"
+        return node.parentId, None
+    # Downward (or a nested subagent asking its own child): the asker must be
+    # the DIRECT parent of the explicit addressee. This one check rejects
+    # siblings, cross-level pairs, and self-addressing at once.
+    if not ctx.graph.has_node(to):
+        return None, f"unknown agent: {to}"
+    if ctx.graph.get_node(to).parentId != frm:
+        return None, (
+            f"question scope violation: {frm} is not the direct parent of "
+            f"{to} (Q&A is restricted to direct parent/child within one "
+            f"conversation; siblings and cross-level asking are not allowed)"
+        )
+    return to, None
+
+
+async def _qa_deliver_question(ctx: ApiContext, addressee: str, message: str) -> bool:
+    """Deliver a question to its addressee (best-effort, never blocking).
+
+    * Live process  -> RPC ``steer``: the question is queued and delivered
+      after the addressee's current tool calls, before its next model call
+      (the same channel ``steer_subagent`` uses — an in-flight agent is
+      redirected, not restarted).
+    * Idle/unloaded -> wake it with a follow-up prompt via
+      ``process_manager.followup_subagent``. That one call is the whole
+      existing lazy-load machinery: it respawns the agent from its persisted
+      ``--session`` file when the process was reaped, resets the subagent
+      result/state bookkeeping so a later ``subagent_result`` poll describes
+      the new turn, flips the node back to running, and finally delivers the
+      prompt. It works for primaries and subagents alike, and reusing it here
+      avoids duplicating the ensure_loaded + prompt wiring route-side.
+
+    Returns True when the message reached a process. When delivery fails
+    entirely the question stays pending in the store (pull-based retrieval).
+    """
+    if ctx.processes.get(addressee) is not None:
+        try:
+            await ctx.processes.send_command(
+                addressee, {"type": "steer", "message": message}
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("QA steer to %s failed (%s); trying wake path", addressee, exc)
+    try:
+        result = await ctx.processes.followup_subagent(addressee, message)
+        return bool(result and result.get("ok"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("QA wake of %s failed (%s)", addressee, exc)
+        return False
+
+
+async def _qa_deliver_answer(ctx: ApiContext, asker: str, message: str) -> bool:
+    """Deliver an answer to the asker; NEVER wake an idle asker (ADR-0001).
+
+    A still-RUNNING asker gets the answer steer-injected (tagged with the
+    questionId) so its in-flight turn can use it. An asker that already
+    settled keeps its schedule: the answer stays in the store for retrieval
+    via ``question_status`` / ``pending_questions``.
+    """
+    if ctx.processes.get(asker) is None:
+        return False
+    try:
+        await ctx.processes.send_command(asker, {"type": "steer", "message": message})
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("QA answer delivery to %s failed (%s); left in store", asker, exc)
+        return False
 
 
 async def _handle_command(
@@ -831,6 +1003,104 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
         reference client, docs) that still POST here keep working.
         """
         return await hive_agent_glimpse(body)
+
+    # -- inter-agent Q&A (ADR-0001 / issue #4) ----------------------------
+    @app.post("/hive/agent/ask")
+    async def hive_agent_ask(body: AgentAskIn) -> Dict[str, Any]:
+        """Pose a question to an agent sharing a DIRECT parent/child edge.
+
+        Two directions (ADR-0001):
+          * downward — ``to`` names a direct child of ``from``;
+          * upward   — ``to`` omitted; ``from`` must be a subagent and the
+            addressee is resolved from its graph ``parentId``.
+        Siblings, cross-level pairs, and unknown ids are rejected. The
+        ``agent_allowlist`` does not participate in Q&A addressing.
+
+        Async by design (ADR-0001): the questionId is returned immediately;
+        the answer arrives later via steer injection (running asker) or is
+        retrieved via ``question_status`` / ``pending_questions``.
+        Delivery of the QUESTION to the addressee is best-effort: a live
+        process is steered; an idle/unloaded addressee is woken with a
+        follow-up prompt (lazy respawn from its persisted session).
+        """
+        question = (body.question or "").strip()
+        if not question:
+            return {"ok": False, "questionId": "", "error": "question text is empty"}
+        addressee, err = _qa_resolve_addressee(ctx, body.frm, body.to)
+        if err is not None or addressee is None:
+            return {"ok": False, "questionId": "", "error": err or "question scope violation"}
+
+        record = ctx.qa.create(frm=body.frm, to=addressee, question=question)
+        qid = record["id"]
+        delivered = await _qa_deliver_question(
+            ctx, addressee, _qa_question_message(qid, body.frm, question)
+        )
+        return {"ok": True, "questionId": qid, "delivered": delivered, "error": ""}
+
+    @app.post("/hive/agent/answer")
+    async def hive_agent_answer(body: AgentAnswerIn) -> Dict[str, Any]:
+        """Answer a question — exactly once, by the addressee only.
+
+        ``from`` must equal the question's addressee. The first answer is
+        permanent: a later answer is rejected with the existing answer handed
+        back. On the first answer the asker is notified via steer injection
+        when its process is live; an idle asker is deliberately NOT woken
+        (ADR-0001) — the answer stays in the store for pull-based retrieval.
+        """
+        text = (body.text or "").strip()
+        if not text:
+            return {"ok": False, "questionId": body.questionId, "error": "answer text is empty"}
+
+        record = ctx.qa.get(body.questionId)
+        if record is None:
+            return {"ok": False, "questionId": body.questionId,
+                    "error": f"unknown question id: {body.questionId}"}
+        if record["to"] != body.frm:
+            return {"ok": False, "questionId": body.questionId,
+                    "error": (f"only the addressee may answer: question "
+                              f"{body.questionId} is addressed to {record['to']}")}
+
+        ok, stored, err = ctx.qa.answer(body.questionId, text)
+        if not ok:
+            # Exactly-once rejection: hand back the answer that already won.
+            return {"ok": False, "questionId": body.questionId, "error": err,
+                    "answer": (stored or {}).get("answer")}
+
+        asker = record["from"]
+        delivered = await _qa_deliver_answer(
+            ctx, asker, _qa_answer_message(body.questionId, body.frm, text)
+        )
+        return {"ok": True, "questionId": body.questionId, "delivered": delivered}
+
+    @app.post("/hive/agent/question_status")
+    async def hive_agent_question_status(body: QuestionStatusIn) -> Dict[str, Any]:
+        """Fetch one question record — asker or addressee only.
+
+        The pull path of Q&A: an agent that settled before its answer (or its
+        question) arrived retrieves it here on its own schedule.
+        """
+        record = ctx.qa.get(body.questionId)
+        if record is None:
+            return {"ok": False, "questionId": body.questionId,
+                    "error": f"unknown question id: {body.questionId}"}
+        if body.frm not in (record["from"], record["to"]):
+            return {"ok": False, "questionId": body.questionId,
+                    "error": "only the asker or the addressee may query this question"}
+        out: Dict[str, Any] = {"ok": True, "questionId": body.questionId, "question": record}
+        if record["status"] == "answered":
+            out["answer"] = record["answer"]
+        return out
+
+    @app.post("/hive/agent/pending_questions")
+    async def hive_agent_pending_questions(body: PendingQuestionsIn) -> Dict[str, Any]:
+        """List the questions this agent asked that are still pending.
+
+        These are the answers the agent is owed (its bounded to-do list of
+        outstanding questions); answered questions drop off the list.
+        """
+        if not ctx.graph.has_node(body.frm):
+            return {"ok": False, "questions": [], "error": f"unknown agent: {body.frm}"}
+        return {"ok": True, "questions": ctx.qa.pending_asked_by(body.frm), "error": ""}
 
     @app.websocket("/ws")
     async def api_ws(websocket: WebSocket) -> None:
