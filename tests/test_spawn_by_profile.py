@@ -271,6 +271,64 @@ async def _test_agent_matching_existing_node_targets_it() -> None:
 
 
 # ---------------------------------------------------------------------------
+# HTTP /api/prompt shares the same _handle_command path — pin that an
+# `agent` value naming an eligible profile ALSO spawns by profile there
+# (issue #7 design consequence, mirrors /api/primary/spawn).
+# ---------------------------------------------------------------------------
+def test_http_prompt_eligible_profile_spawns_new_primary() -> None:
+    from fastapi.testclient import TestClient
+    from hive.server import create_api_app
+
+    graph = _tree_with_existing()
+    pm = RecordingPM()
+    cfg = build_config()
+    captured: Dict[str, Any] = {}
+    ctx = _ctx(graph, pm, _make_spawn_primary(graph, cfg, captured))
+    client = TestClient(create_api_app(ctx))
+    before = len(graph.get_tree())
+
+    resp = client.post("/api/prompt", json={"agent": "coder", "message": "code it up"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True, body
+    assert captured["agent"] == "coder"
+    # A new node was created; the prompt went to the NEW primary, not any
+    # existing node.
+    assert len(graph.get_tree()) == before + 1
+    new_id = [n.id for n in graph.get_tree() if n.id not in (PRIMARY, EXISTING)][0]
+    node = next(n for n in graph.get_tree() if n.id == new_id)
+    assert node.kind == "primary"
+    assert node.profile.name == "coder"  # spawned profile, not default_primary
+    assert pm.send_calls and pm.send_calls[0]["agent"] == new_id
+    assert pm.send_calls[0]["cmd"]["message"] == "code it up"
+
+
+def test_http_prompt_bad_profile_errors_and_creates_no_node() -> None:
+    from fastapi.testclient import TestClient
+    from hive.server import create_api_app
+
+    for bad_agent, err_fragment in (("no-such", "unknown agent"),
+                                    ("tester", "not primary-eligible")):
+        graph = _tree_with_existing()
+        pm = RecordingPM()
+        cfg = build_config()
+        captured: Dict[str, Any] = {}
+        ctx = _ctx(graph, pm, _make_spawn_primary(graph, cfg, captured))
+        client = TestClient(create_api_app(ctx))
+        before = len(graph.get_tree())
+
+        resp = client.post("/api/prompt", json={"agent": bad_agent, "message": "hi"})
+
+        body = resp.json()
+        assert resp.status_code == 200
+        assert body["success"] is False, body
+        assert err_fragment in body["error"], body
+        assert len(graph.get_tree()) == before  # NO node created
+        assert pm.send_calls == []  # nothing delivered
+
+
+# ---------------------------------------------------------------------------
 # pytest entry points
 # ---------------------------------------------------------------------------
 def test_spawn_by_eligible_profile() -> None:
@@ -306,3 +364,4 @@ def test_agentid_addressed_prompt_unchanged() -> None:
 def test_agent_matching_existing_node_targets_it() -> None:
     import asyncio
     asyncio.run(_test_agent_matching_existing_node_targets_it())
+

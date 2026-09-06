@@ -93,6 +93,9 @@ response path, including error responses.
   error and NO node is created. When `agent` instead matches an EXISTING
   node id it targets that conversation (the long-standing alias), so
   profile-spawn only kicks in for names that are not node ids.
+  **The same behavior applies to the HTTP `POST /api/prompt` route** — it
+  shares the same dispatch path, so `agent` naming a profile there also
+  spawns a new primary on that profile.
 
 ### 2.2 Continue / steer an existing agent
 ```json
