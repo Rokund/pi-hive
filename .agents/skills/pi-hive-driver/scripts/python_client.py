@@ -11,6 +11,9 @@ It speaks only the WebSocket protocol documented in SKILL.md:
 
 Only one third-party dependency: `websocket-client` (pip install websocket-client),
 plus Python's stdlib for everything else. No `requests`, no external constants.
+The correctness-critical frame-folding and spawn-discovery logic is shared with
+the async daemon in `hive_protocol.py` (this directory) so the two drivers can
+never drift apart on protocol invariants.
 
 The `subagent_*` tools (spawn/result/abort/steer/followup/glimpse) are HTTP
 endpoints that the PRIMARY calls via its extension — a WS-only driver normally
@@ -36,6 +39,8 @@ from typing import Any, Optional
 from urllib.parse import urlsplit
 
 import websocket  # websocket-client  (pip install websocket-client)
+
+from hive_protocol import TurnTracker, primary_ids_from_tree
 
 
 class HiveError(Exception):
@@ -115,7 +120,7 @@ class HiveClient:
 
     def _primary_ids(self) -> set[str]:
         try:
-            return {n["id"] for n in self.get_tree() if n.get("kind") == "primary"}
+            return primary_ids_from_tree(self.get_tree())
         except Exception:
             return set()
 
@@ -155,16 +160,19 @@ class HiveClient:
         — or, when the settle event carried no payload, from the completing
         node snapshot / last snapshot seen — so it no longer lags behind the
         settle signal.
+
+        Frame folding (settle signals, `message_end` extraction, tool dedupe)
+        and new-primary discovery are delegated to `TurnTracker` in
+        `hive_protocol.py` — the shared, single source for those invariants.
         """
         if not self.check_online():
             raise HiveError("pi-hive not reachable at " + self.ws_url)
 
         pre = self._primary_ids()
         target: Optional[str] = agent_id
-        final_texts: list[str] = []
-        tool_calls: list[dict] = []
-        seen_tool_keys: set = set()
-        observed: dict[str, dict] = {}
+        tracker = TurnTracker(pre_primary_ids=pre)
+        if target:
+            tracker.claim(target)
         frames: list = []
 
         ws = self._connect()
@@ -195,11 +203,13 @@ class HiveClient:
                 if frame.get("type") == "response" and frame.get("command") == "prompt":
                     acked = True
 
-                signal = self._observe(frame, target, observed,
-                                       final_texts, tool_calls, seen_tool_keys)
+                signal = tracker.observe(frame)
                 # Discover the freshly spawned primary if we asked for a new one.
                 if target is None:
-                    target = self._discover_new_primary(frame, pre, target)
+                    new = tracker.discover(frame, target)
+                    if new is not None:
+                        target = new
+                        tracker.claim(new)
                 # Completion: authoritative settled signal, or done node
                 # status — but only from frames read after our prompt's ack.
                 if acked and target and signal and signal.get("agent_id") == target:
@@ -216,118 +226,18 @@ class HiveClient:
         if settle_signal is not None:
             status = settle_signal.get("status")
         if status is None:
-            status = (observed.get(target) or {}).get("status")
+            status = (tracker.observed.get(target) or {}).get("status")
 
         return {
             "agent_id": target,
             "settled": settled,
             "status": status,
-            "final_text": final_texts[-1] if final_texts else "",
-            "transcript": final_texts,
-            "tool_calls": tool_calls,
+            "final_text": tracker.final_texts[-1] if tracker.final_texts else "",
+            "transcript": tracker.final_texts,
+            "tool_calls": tracker.tool_calls,
             "frame_count": len(frames),
             "duration_s": round(time.time() - start, 1),
         }
-
-    # ------------------------------------------------------------- frame intake
-    @staticmethod
-    def _snapshot(node: dict) -> dict:
-        st = node.get("status")
-        done = st in ("idle", "done")
-        last = node.get("lastResult") or {}
-        return {"status": st, "done": done,
-                "final_text": (last.get("finalText") or last.get("final_text") or "")}
-
-    @staticmethod
-    def _is_done(snap: Optional[dict]) -> bool:
-        return bool(snap and snap.get("done"))
-
-    @staticmethod
-    def _discover_new_primary(frame: dict, pre: set, current: Optional[str]) -> Optional[str]:
-        """Find a primary id that did not exist before we sent the bare prompt.
-
-        The new root appears in a `hive:agent_updated` or `hive:tree` frame after
-        the bare prompt is accepted. Only ids we had NOT seen before the send
-        qualify, so we never grab a pre-existing conversation.
-        """
-        candidates: list[str] = []
-        if frame.get("type") == "hive:agent_updated":
-            ag = frame.get("agent") or {}
-            if ag.get("kind") == "primary" and ag.get("id"):
-                candidates.append(ag["id"])
-        if frame.get("type") == "hive:tree":
-            for n in frame.get("tree") or []:
-                if n.get("kind") == "primary" and n.get("id"):
-                    candidates.append(n["id"])
-        for cid in candidates:
-            if cid not in pre and cid != current:
-                return cid
-        return None
-
-    def _observe(self, frame, target, observed, final_texts,
-                 tool_calls, seen_tool_keys) -> Optional[dict]:
-        """Fold one frame into the running drive state.
-
-        Returns a settle-signal dict `{agent_id, status, kind, source}` when
-        THIS frame marks an agent settled or done — an `agent_settled` event
-        (carrying the hive-computed `settled: {kind, status, terminal}`
-        payload) or a node snapshot whose status is idle/done — else None.
-        The caller decides whether the signal completes the drive (same agent
-        as the target, and only after the prompt ack).
-        """
-        t = frame.get("type")
-        if t == "hive:agent_updated":
-            ag = frame.get("agent") or {}
-            if ag.get("id"):
-                snap = self._snapshot(ag)
-                observed[ag["id"]] = snap
-                if self._is_done(snap):
-                    return {"agent_id": ag["id"], "status": snap.get("status"),
-                            "kind": ag.get("kind"), "source": "snapshot"}
-            return None
-        if t != "hive:event":
-            return None
-        ev = frame.get("event") or {}
-        aid = frame.get("agentId")
-        etype = ev.get("type")
-        if etype == "agent_settled" and aid:
-            s = ev.get("settled") or {}
-            return {"agent_id": aid, "status": s.get("status"),
-                    "kind": s.get("kind"), "source": "settled"}
-        if etype == "message_end":
-            # A subscriber socket carries events for EVERY agent. Only collect
-            # the assistant's text when it belongs to our target, so other
-            # conversations and subagents don't leak into our result.
-            if aid and aid == target:
-                msg = ev.get("message")
-                if isinstance(msg, dict) and msg.get("role") == "assistant":
-                    for b in self._block_texts(msg):
-                        final_texts.append(b)
-            return None
-        # Record each tool call exactly once (end frame), keyed by its id.
-        # The tool's name lives in `toolName`; `toolCallId` stays the dedupe key.
-        if etype == "tool_execution_end" and aid and aid == target:
-            name = ev.get("toolName") or ev.get("name")
-            key = (aid, ev.get("toolCallId") or ev.get("id") or f"{aid}:{name}:{time.time()}")
-            if key not in seen_tool_keys:
-                seen_tool_keys.add(key)
-                tool_calls.append({"agentId": aid, "name": name})
-        return None
-
-    @staticmethod
-    def _block_texts(message: Optional[dict]) -> list[str]:
-        """Extract text from a message.content[] list (the final-answer shape)."""
-        if not isinstance(message, dict):
-            return []
-        content = message.get("content")
-        out: list[str] = []
-        if isinstance(content, list):
-            for c in content:
-                if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
-                    out.append(str(c["text"]))
-        elif isinstance(content, str) and content.strip():
-            out.append(content)
-        return out
 
     # ------------------------------------------- optional HTTP peek (glimpse) --
     # The glimpse endpoint is HTTP and exposed for ANY agent (primary or

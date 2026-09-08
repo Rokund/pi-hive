@@ -247,6 +247,62 @@ Treat `message_end` + a completion signal (node status, or `agent_settled`) as
 
 ---
 
+## 6. Async / daemon variant (harness-friendly): `scripts/hivedriver.py`
+
+The working directory here is this skill's directory (`.agents/skills/pi-hive-driver/`);
+`scripts/...` paths below are relative to it — from the repo root that is
+`.agents/skills/pi-hive-driver/scripts/...`.
+
+`python_client.py` (§above) is a **blocking, single-shot** driver: one call
+holds the socket for the whole turn, so the outer agent can't steer mid-turn
+or do other work while a long turn runs. For an agent harness where each tool
+call is a fresh process, `scripts/hivedriver.py` is the async variant: a
+persistent daemon that owns the socket and accepts commands over a FIFO,
+streaming JSON-lines to a log. Its protocol correctness is **not re-implemented**
+and not merely "copied" from `python_client` — both drivers share the SAME
+frame-folding and spawn-discovery logic in `scripts/hive_protocol.py`
+(completion gated on `agent_settled` behind the ack barrier, `message_end` not
+deltas, target filtering, bare-prompt spawn discovery, tool dedupe, fail-fast
+on drop), so they cannot drift apart on invariants.
+
+Unlike the single-shot client, the daemon tracks **many concurrent turns**:
+
+* Frames stream for EVERY agent on the socket; the daemon routes each frame to
+the turn whose agent id it carries, so different in-flight agents never
+contaminate each other's transcript or settlement.
+* Several **bare prompts** (spawns) may be in flight at once. New primary ids
+are disambiguated by spawn order plus a claimed-id set — each brand-new id is
+assigned to the oldest unresolved spawn whose pre-prompt tree snapshot did not
+already contain it, and never assigned twice. Distinct spawns get distinct ids
+and are driven independently.
+* The ack barrier is **per-turn** and attributed by `reqId` (each command's
+unique `reqId` is echoed verbatim by the server — SKILL.md §2), so a stale
+signal from an earlier conversation on the same agent can never complete a new
+turn. At most **one in-flight turn per agent id** stays the rule; a second
+prompt to a busy agent returns an immediate `busy` ack.
+
+Usage (daemon):
+```
+python3 scripts/hivedriver.py --daemon --ws ws://127.0.0.1:3001/ws --fifo /tmp/hd.in --log /tmp/hd.log
+```
+Commands (one JSON object per line on the FIFO):
+- `{"op":"prompt","text":...,"agentId":?, "cwd":?, "label":?}` — launch a turn,
+  returns a `cmdId` **immediately** (+ the discovered `agentId` for a bare spawn;
+  a bare prompt to a busy agent returns `busy`, and multiple distinct spawns
+  may run concurrently).
+- `{"op":"steer"|"follow_up"|"abort","agentId":...,"text"|...}` — side-channel controls.
+- `{"op":"status","cmdId":...}` — non-blocking structured status (cached after settle).
+- `{"op":"wait","cmdId":...,"timeout_s":N}` — block up to N in the daemon for a
+  structured result; safe to call repeatedly, never forces the agent to parse
+  raw log JSON.
+- `{"op":"get_tree"}`, `{"op":"ping"}` (reports all in-flight `cmdId`s).
+
+Do not break: one in-flight turn per agent id keeps that agent's ack barrier
+airtight; `reqId` (never arrival order) attributes acks; steer/abort/follow_up
+stay free side-channels.
+
+---
+
 This skill concerns **you, the driver**. You do not touch Python,
 `hive.config.json`, session files, or how the daemon is launched — the hive is an
 infrastructure detail that is already running for you.
