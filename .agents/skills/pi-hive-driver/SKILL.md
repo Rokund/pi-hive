@@ -188,6 +188,20 @@ GET /api/agent/{id}/events?since=<lastSeq>
   - `message_end` — the **authoritative** final text of a turn; use this, not deltas.
   - `tool_execution_*` — a tool invocation on that node.
   - `turn_end` / `agent_settled` — lifecycle boundaries / the agent stopped.
+
+**`message_end` field shape.** The final text is nested — there is no
+`event.text`. A `message_end` event looks like:
+```json
+{ "type": "hive:event", "agentId": "<id>", "seq": 123,
+  "event": { "type": "message_end",
+              "message": { "role": "assistant",
+                            "content": [ { "type": "text", "text": "<the answer>" } ] } } }
+```
+Read the text from `event.message.content` — walk the array and collect every
+`{type:"text", text}` part (skip `thinking`/`toolResult` parts). Different
+message roles (`user` / `assistant` / `toolResult`) each produce their own
+`message_end`; extract only the `assistant` ones for the agent's answers.
+
 - Treat `message_end` + a completion signal (node status from `/hive/agent/wait`
   or `/api/agent/{id}`) as "the turn ended" before issuing the next command.
 
@@ -239,6 +253,10 @@ texts from the event backlog.
 ---
 
 ## 5. A minimal safe loop
+
+The loop below is the **general** drive pattern and is the one to use for
+orchestrated / multi-turn tasks (a single `drive()` is only for a one-shot
+single-turn task — see §6.2).
 
 1. `GET /api/tree` to see what exists (or start fresh).
 2. Create work: `POST /api/primary/spawn` (capture the new `id`), then
@@ -296,6 +314,22 @@ Add `--json` (before the subcommand) for structured JSON output.
 
 - `drive` prints `agent_id`, `settled`, `status`, `final_text`. `settled: True`
   means the turn finished and `final_text` is the agent's answer.
+
+**`drive` is single-turn only — do not use it to wrap a multi-turn delegation.**
+`drive` completes when the **primary's one turn** settles (it returns to `idle`
+after yielding to a subagent it spawned). If your task makes the primary
+orchestrate — e.g. it spawns a subagent and then must report back after that
+subagent finishes — `drive` will stop at the primary's *opening* message
+("I'll delegate this to coder1"), not at the real final answer. For orchestrated
+/multi-turn work, do **not** rely on a single `drive`; drive the conversation
+and read the end result yourself via the safe loop in §5:
+
+```
+spawn -> prompt -> wait (re-issue until status != "running") -> GET /events
+     -> keep every message_end text for that id
+```
+and treat a settle as "this turn ended", not "the whole job is done".
+
 - `wait` is the sanctioned long-poll: it returns immediately for a settled
   agent, or `status:"running"` + live `progress` while a turn is in flight. To
   wait out a turn, re-issue it until `status != "running"`.
