@@ -26,13 +26,13 @@ isolated LLM "agent") and answers your HTTP requests with the results.
 > WebSocket only for that GUI; external drivers use HTTP only, with no
 > connection lifecycle to maintain (each request is self-contained).
 
-> **Just drive it.** The one tool is the CLI at `scripts/hive_cli.py` (alias
-> `pi-hive-driver`). It already does every action below — spawn, prompt/steer/
-> follow_up/abort, wait-for-settle, glimpse, tree, questions — against a
-> running hive, with concrete parameters. To do any of the things described in
-> this skill, run `python scripts/hive_cli.py <subcommand> ...`; you do NOT
-> need to reimplement the protocol. Only Python's stdlib is used — no third-
-> party package.
+> **Handy starting point.** A ready CLI at `scripts/hive_cli.py` already does
+> every action below — spawn, prompt/steer/follow_up/abort, wait-for-settle,
+> glimpse, tree, questions — against a running hive, with concrete parameters.
+> For the things described in this skill you can run
+> `python scripts/hive_cli.py <subcommand> ...` directly; the protocol details
+> are already handled. It uses only Python's stdlib — no third-party package.
+> Feel free to use it, or to adapt it however suits you.
 
 Every `/api` command endpoint returns the **bare `{ok, ...}`** dialect (no WS
 envelope) when called with the request header
@@ -254,11 +254,13 @@ texts from the event backlog.
 
 ---
 
-## 6. The CLI — this is all you use
+## 6. The CLI
 
-The one tool is `scripts/hive_cli.py`. Don't hand-roll a driver; use the CLI for
-every action in this skill. It's verified against a real running hive and the
-only dependency is Python's stdlib.
+A ready CLI lives at `scripts/hive_cli.py` (verified against a real running
+hive, stdlib-only). It's the quickest way to every action in this skill —
+though if writing your own driver feels right for your use case, the protocol
+is fully described below and the `HiveClient` methods are public. The CLI is
+just the convenient path, not a gate.
 
 > Path from the repo root:
 > `.agents/skills/pi-hive-driver/scripts/hive_cli.py`
@@ -300,14 +302,15 @@ Add `--json` (before the subcommand) for structured JSON output.
 - `glimpse` returns `complete` (authoritative: `false` = live fragment, `true` =
   final answer), `phase`, and a `text` tail. Rely on `complete`, not `status`.
 
-### 6.3 When you must extend
+### 6.3 Extending
 
-If the CLI lacks an action you need, extend `scripts/hive_cli.py` (add a
-subcommand calling the `HiveClient` method) — don't fork a separate client.
-The `HiveClient` class in that same file is the HTTP driver; its methods are
-`spawn`, `prompt`, `steer`, `follow_up`, `abort`, `wait`, `drive`, `get_tree`,
-`get_agent`, `questions`, `agent_glimpse`, `check_online`. Two real failures a
-reimplementation must handle (already handled here):
+If the CLI doesn't cover something you need, you can add a subcommand to
+`scripts/hive_cli.py` or write your own driver — both share the well-defined
+HTTP protocol in this skill. The `HiveClient` class in that file is a working
+HTTP driver; its methods are `spawn`, `prompt`, `steer`, `follow_up`, `abort`,
+`wait`, `drive`, `get_tree`, `get_agent`, `questions`, `agent_glimpse`,
+`check_online`. Worth knowing (the CLI already handles these, and a fresh
+implementation would need to too):
 1. A settled primary's `/hive/agent/wait` payload carries no `finalText` — the
    answer comes only from the event backlog.
 2. The settle signal can beat the event-record flush, so `drive()` reads the
@@ -319,7 +322,7 @@ reimplementation must handle (already handled here):
 (primaries settle to `idle`, subagents to `done`) so a finished primary returns
 promptly. The old WS-based drivers (`python_client.py`, `hivedriver.py`, and
 the shared `hive_protocol.py`) were removed — the WebSocket is reserved for the
-web GUI only; external drivers use HTTP through this CLI.
+web GUI only; external driving is over HTTP.
 
 Drive-loop invariants:
 - Completion is the settle signal (a settled node status from the long-poll), never
