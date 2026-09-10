@@ -260,6 +260,27 @@ The working directory here is this skill's directory (`.agents/skills/pi-hive-dr
 `scripts/...` paths below are relative to it — from the repo root that is
 `.agents/skills/pi-hive-driver/scripts/...`.
 
+### 6.1 Quickstart — verified to work (do NOT hand-roll a client)
+
+From the repo root, against the configured hive (API port is `server.apiPort`
+in `hive.config.json`, e.g. 4101):
+
+```bash
+# end-to-end drive (spawn + prompt + wait-for-settle + read the answer)
+.venv/bin/python .agents/skills/pi-hive-driver/scripts/http_client.py \
+    --host 127.0.0.1 --port 4101 \
+    --prompt "Reply with exactly one short sentence about the Eiffel Tower." \
+    --wall-timeout 120
+```
+
+This is the **verified-on-a-real-running-hive** path — it prints `agent_id`,
+`settled: True`, `status`, and the agent's `final_text`. If you find yourself
+writing a bespoke driver instead of calling this, you are duplicating work:
+hand-rolled clients routinely miss the two failure modes this one already
+handles (see 6.3). Use this script or the `HiveClient` methods it wraps.
+
+### 6.2 `HiveClient`
+
 `scripts/http_client.py` is the single, HTTP-only reference client (issue #12):
 - `HiveClient(host="127.0.0.1", port=3001)` (or `api_base=...`, or the
   `PI_HIVE_API_HOST` / `PI_HIVE_API_PORT` / `PI_HIVE_API_BASE` env vars) — the
@@ -269,10 +290,32 @@ The working directory here is this skill's directory (`.agents/skills/pi-hive-dr
   `get_tree`, `get_agent`, `questions`, `agent_glimpse`, `check_online`.
 - `drive(prompt, agent_id=None, cwd=None, wall_timeout=1800)` is the blocking
   complete-turn driver: it spawns (if no `agent_id`), sends the task,
-  long-polls `/hive/agent/wait` until the agent settles, then pulls the
+  long-polls `/hive/agent/wait` until the agent settles, then reads the
   `message_end` transcripts from the event backlog. It raises `HiveError` on
   transport/protocol failure instead of busy-spinning.
 - Only dependency: Python's stdlib `urllib`. No third-party package.
+
+### 6.3 Two failure modes the reference client already handles
+
+These are real ops conditions found by driving a live hive; a hand-rolled
+client must handle them or it will hang or return empty output:
+1. **`/api/primary/spawn` + the node settles, but the answer is NOT in the
+   `POST /hive/agent/wait` payload** — primaries settle to `idle` and their
+   wait payload carries no `finalText`. Final text comes only from the event
+   backlog (`message_end`).
+2. **The settle signal can beat the event-record flush** — right after
+   the agent settles, an immediate `events` read may still be empty. `drive()`
+   polls the backlog briefly until `message_end` appears (bounded by the wall
+   timeout) instead of giving up after one empty read.
+
+### 6.4 Server-side note (correctness fix shipped with this issue)
+
+`POST /hive/agent/wait` previously reported a **settled primary as `running`
+forever** because the primary prompt path never marks the in-memory state
+terminal. It now short-circuits on the authoritative graph-node status
+(primaries settle to `idle`, subagents to `done`), so the long-poll returns
+promptly for a finished primary. Do not reintroduce dependence on the
+in-memory `status` for completion detection.
 
 The old WS-based drivers (`python_client.py`, `hivedriver.py`, and the shared
 `hive_protocol.py`) were removed — external callers no longer maintain a

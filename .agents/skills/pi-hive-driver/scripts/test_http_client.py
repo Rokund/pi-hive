@@ -39,9 +39,15 @@ class CountdownHive:
       GET /api/tree                  -> {ok, tree:[...]}
     """
 
-    def __init__(self, waits_before_settle: int = 0, final_text: str = "done"):
+    def __init__(self, waits_before_settle: int = 0, final_text: str = "done",
+                 events_empty_until: int = 0):
         self.waits_before_settle = waits_before_settle
         self.final_text = final_text
+        # Emulate the real racer: /hive/agent/wait can signal settle a beat
+        # before the message_end is queryable. Events return EMPTY for the
+        # first `events_empty_until` reads, then the backlog appears.
+        self.events_empty_until = events_empty_until
+        self.events_reads = 0
         self.wait_calls = 0
         self.prompt_calls = 0
         self.spawn_calls = 0
@@ -84,6 +90,10 @@ class CountdownHive:
                 if self.path.startswith("/api/agent/") and "/events" in self.path:
                     import re
                     m = re.match(r"/api/agent/([^/]+)/events", self.path)
+                    h.events_reads += 1
+                    if h.events_reads <= h.events_empty_until:
+                        return self._send({"ok": True, "agentId": m.group(1),
+                                           "events": [], "latest": 0})
                     return self._send({
                         "ok": True, "agentId": m.group(1), "events": [
                             {"agentId": m.group(1), "event": {
@@ -152,6 +162,17 @@ def test_drive_waits_until_settle():
     assert res["settled"] is True
     assert h.wait_calls >= 3  # one for each running wait + settle
     assert res["final_text"] == "after two waits"
+
+
+def test_drive_reads_final_text_despite_event_lag():
+    # Real racer: settle signals before message_end is readable. The client
+    # must retry the event backlog (not give up after a single empty read).
+    h = CountdownHive(waits_before_settle=0, final_text="laggy answer",
+                      events_empty_until=2)
+    res = h.client().drive(prompt="hi", wall_timeout=20)
+    assert res["settled"] is True
+    assert res["final_text"] == "laggy answer"
+    assert h.events_reads >= 3  # empty reads then the real one
 
 
 def test_spawn_via_primary_spawn_then_prompt():

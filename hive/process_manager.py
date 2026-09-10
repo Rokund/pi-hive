@@ -1278,6 +1278,27 @@ class ProcessManager:
         if self.graph is not None and self.graph.has_node(node_id):
             node = self.graph.get_node(node_id)
 
+        # Authoritative-settled short-circuit: the graph node status is the
+        # source of truth for whether an agent's turn has ended (primaries
+        # settle to `idle`, subagents to `done`).  A node that is already
+        # settled must return immediately even when the in-memory
+        # `_AgentState` has NOT been marked terminal — which is the norm for
+        # primaries, because the primary prompt path never sets the
+        # `_prompted` flag that would let `_ingest` transition the state to
+        # `done`.  Without this guard `wait_for_agent` would report a settled
+        # primary as `running` forever (the very bug that made the HTTP-only
+        # watch-loop unusable).  Only a genuinely in-flight node (status
+        # `running`) is allowed to block.
+        if node is not None and node.status in ("done", "failed", "aborted", "idle"):
+            payload: Dict[str, Any] = {"ok": True, "id": node_id}
+            if st is not None and st.status in ("done", "failed", "aborted"):
+                payload.update(self._result_payload(st, node_id))
+            # The graph node status is authoritative (primaries settle to
+            # `idle`, subagents to `done`); never let the in-memory state's
+            # label overwrite it.
+            payload["status"] = node.status
+            return payload
+
         if st is not None and st.status in ("done", "failed", "aborted"):
             payload = self._result_payload(st, node_id)
             payload["id"] = node_id

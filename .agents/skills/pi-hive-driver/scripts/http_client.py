@@ -270,7 +270,13 @@ class HiveClient:
 
         if settled:
             # Pull the authoritative transcripts from the event backlog.
-            transcript = self._final_texts(target)
+            # On the real hive the settle signal can beat the event-record
+            # flush by a moment, so poll briefly for the message_end(s) rather
+            # than trusting a single read. The events endpoint is the only
+            # sanctioned source of final text over HTTP.
+            transcript = self._read_final_texts_with_retry(
+                target, deadline=start + wall_timeout
+            )
             if final_text not in transcript:
                 # Prefer the settled final text when the event replay lacks it.
                 transcript = [final_text] if final_text else transcript
@@ -287,6 +293,25 @@ class HiveClient:
             "frame_count": len(frames),
             "duration_s": round(time.time() - start, 1),
         }
+
+    def _read_final_texts_with_retry(self, agent_id: str, *, deadline: float,
+                                     retry_delay: float = 0.5) -> List[str]:
+        """Read the agent's final assistant texts, retrying briefly.
+
+        The settle signal (from /hive/agent/wait) can arrive just before the
+        corresponding message_end is recorded/queryable in the event backlog.
+        Poll the events endpoint until it returns at least one message_end or
+        ``deadline`` passes. Returns the collected texts (possibly empty if
+        the backlog never produced a message_end).
+        """
+        texts: List[str] = []
+        while True:
+            texts = self._final_texts(agent_id)
+            if texts:
+                return texts
+            if time.time() >= deadline:
+                return texts
+            time.sleep(retry_delay)
 
     def _final_texts(self, agent_id: str, since: int = 0) -> List[str]:
         """Assistant `message_end` texts from the event backlog, in order."""
