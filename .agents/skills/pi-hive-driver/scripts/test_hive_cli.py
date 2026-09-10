@@ -1,8 +1,8 @@
-"""Dev-only tests for http_client.py against an in-process fake HTTP hive.
+"""Dev-only tests for hive-cli.py against an in-process fake HTTP hive.
 
 Run from the repo root:
 
-    .venv/bin/python -m pytest -q .agents/skills/pi-hive-driver/scripts/test_http_client.py
+    .venv/bin/python -m pytest -q .agents/skills/pi-hive-driver/scripts/test_hive_cli.py
 
 The fake server hosts the bare-`{ok,...}` HTTP endpoints the client calls
 (spawn / prompt / abort / wait / events / tree), driven by scripted state, so
@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from http_client import HiveClient, HiveError  # noqa: E402
+from hive_cli import HiveClient, HiveError  # noqa: E402
 
 
 class CountdownHive:

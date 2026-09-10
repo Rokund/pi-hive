@@ -26,18 +26,18 @@ isolated LLM "agent") and answers your HTTP requests with the results.
 > WebSocket only for that GUI; external drivers use HTTP only, with no
 > connection lifecycle to maintain (each request is self-contained).
 
-> **Writing this as code?** A self-contained, HTTP-only **Python reference
-> client** lives at `scripts/http_client.py`. It implements the exact protocol
-> below (spawn via `/api/primary/spawn`, prompt/steer/follow_up/abort, bare
-> `{ok,...}` dialect, long-poll `/hive/agent/wait` completion, reading
-> `message_end` from the event backlog) with only Python's stdlib (`urllib`) —
-> no `requests`, no `httpx`, no `websocket-client`. Copy it or read it for the
-> correct reasoning pattern for any language.
+> **Just drive it.** The one tool is the CLI at `scripts/hive_cli.py` (alias
+> `pi-hive-driver`). It already does every action below — spawn, prompt/steer/
+> follow_up/abort, wait-for-settle, glimpse, tree, questions — against a
+> running hive, with concrete parameters. To do any of the things described in
+> this skill, run `python scripts/hive_cli.py <subcommand> ...`; you do NOT
+> need to reimplement the protocol. Only Python's stdlib is used — no third-
+> party package.
 
 Every `/api` command endpoint returns the **bare `{ok, ...}`** dialect (no WS
 envelope) when called with the request header
-`Accept: application/vnd.hive.bare+json`. The reference client always sends
-that header; you should too. Without it, the endpoint returns the legacy
+`Accept: application/vnd.hive.bare+json`. The CLI always sends that header.
+Without it, the endpoint returns the legacy
 `{type:"response",...}` envelope — both call the same handler, but for an
 external driver the bare form is the contract.
 
@@ -254,81 +254,78 @@ texts from the event backlog.
 
 ---
 
-## 6. Reference client
+## 6. The CLI — this is all you use
 
-The working directory here is this skill's directory (`.agents/skills/pi-hive-driver/`);
-`scripts/...` paths below are relative to it — from the repo root that is
-`.agents/skills/pi-hive-driver/scripts/...`.
+The one tool is `scripts/hive_cli.py`. Don't hand-roll a driver; use the CLI for
+every action in this skill. It's verified against a real running hive and the
+only dependency is Python's stdlib.
 
-### 6.1 Quickstart — verified to work (do NOT hand-roll a client)
+> Path from the repo root:
+> `.agents/skills/pi-hive-driver/scripts/hive_cli.py`
 
-From the repo root, against the configured hive (API port is `server.apiPort`
-in `hive.config.json`, e.g. 4101):
+Every subcommand takes `--host` / `--port` (or `--api-base`, or the
+`PI_HIVE_API_HOST` / `PI_HIVE_API_PORT` / `PI_HIVE_API_BASE` env vars). The API
+port is `server.apiPort` in `hive.config.json` — never hard-coded.
 
+### 6.1 The actions
+
+Send a task and block for the answer (spawn or target):
 ```bash
-# end-to-end drive (spawn + prompt + wait-for-settle + read the answer)
-.venv/bin/python .agents/skills/pi-hive-driver/scripts/http_client.py \
-    --host 127.0.0.1 --port 4101 \
-    --prompt "Reply with exactly one short sentence about the Eiffel Tower." \
-    --wall-timeout 120
+.venv/bin/python .agents/skills/pi-hive-driver/scripts/hive_cli.py \
+    --host 127.0.0.1 --port 4101 drive --prompt "<task>" [--id <agent>] [--cwd <dir>] [--wall-timeout 1800]
 ```
+Other actions (each is a subcommand):
+```bash
+# start a NEW primary
+... spawn [--agent <profile>] [--model <model>] [--cwd <dir>]
+# send/continue / steer / abort / wait / peek / list
+... prompt   --id <agent> --message "..."
+... steer    --id <agent> --message "..."
+... abort    --id <agent> [--reason "..."]
+... wait     --id <agent> [--wait-time-ms 0]
+... glimpse  --id <agent> [--n 1024]
+... tree
+... agent    --id <agent>
+... questions --id <agent>
+```
+Add `--json` (before the subcommand) for structured JSON output.
 
-This is the **verified-on-a-real-running-hive** path — it prints `agent_id`,
-`settled: True`, `status`, and the agent's `final_text`. If you find yourself
-writing a bespoke driver instead of calling this, you are duplicating work:
-hand-rolled clients routinely miss the two failure modes this one already
-handles (see 6.3). Use this script or the `HiveClient` methods it wraps.
+### 6.2 How to read the answers
 
-### 6.2 `HiveClient`
+- `drive` prints `agent_id`, `settled`, `status`, `final_text`. `settled: True`
+  means the turn finished and `final_text` is the agent's answer.
+- `wait` is the sanctioned long-poll: it returns immediately for a settled
+  agent, or `status:"running"` + live `progress` while a turn is in flight. To
+  wait out a turn, re-issue it until `status != "running"`.
+- `glimpse` returns `complete` (authoritative: `false` = live fragment, `true` =
+  final answer), `phase`, and a `text` tail. Rely on `complete`, not `status`.
 
-`scripts/http_client.py` is the single, HTTP-only reference client (issue #12):
-- `HiveClient(host="127.0.0.1", port=3001)` (or `api_base=...`, or the
-  `PI_HIVE_API_HOST` / `PI_HIVE_API_PORT` / `PI_HIVE_API_BASE` env vars) — the
-  API port is configurable (`hive.config.json` -> `server.apiPort`), so it is
-  never hard-coded.
-- Methods: `spawn`, `prompt`, `steer`, `follow_up`, `abort`, `wait`, `drive`,
-  `get_tree`, `get_agent`, `questions`, `agent_glimpse`, `check_online`.
-- `drive(prompt, agent_id=None, cwd=None, wall_timeout=1800)` is the blocking
-  complete-turn driver: it spawns (if no `agent_id`), sends the task,
-  long-polls `/hive/agent/wait` until the agent settles, then reads the
-  `message_end` transcripts from the event backlog. It raises `HiveError` on
-  transport/protocol failure instead of busy-spinning.
-- Only dependency: Python's stdlib `urllib`. No third-party package.
+### 6.3 When you must extend
 
-### 6.3 Two failure modes the reference client already handles
+If the CLI lacks an action you need, extend `scripts/hive_cli.py` (add a
+subcommand calling the `HiveClient` method) — don't fork a separate client.
+The `HiveClient` class in that same file is the HTTP driver; its methods are
+`spawn`, `prompt`, `steer`, `follow_up`, `abort`, `wait`, `drive`, `get_tree`,
+`get_agent`, `questions`, `agent_glimpse`, `check_online`. Two real failures a
+reimplementation must handle (already handled here):
+1. A settled primary's `/hive/agent/wait` payload carries no `finalText` — the
+   answer comes only from the event backlog.
+2. The settle signal can beat the event-record flush, so `drive()` reads the
+   backlog with a bounded retry rather than a single empty read.
 
-These are real ops conditions found by driving a live hive; a hand-rolled
-client must handle them or it will hang or return empty output:
-1. **`/api/primary/spawn` + the node settles, but the answer is NOT in the
-   `POST /hive/agent/wait` payload** — primaries settle to `idle` and their
-   wait payload carries no `finalText`. Final text comes only from the event
-   backlog (`message_end`).
-2. **The settle signal can beat the event-record flush** — right after
-   the agent settles, an immediate `events` read may still be empty. `drive()`
-   polls the backlog briefly until `message_end` appears (bounded by the wall
-   timeout) instead of giving up after one empty read.
+### 6.4 Server notes
 
-### 6.4 Server-side note (correctness fix shipped with this issue)
+`POST /hive/agent/wait` short-circuits on the authoritative graph-node status
+(primaries settle to `idle`, subagents to `done`) so a finished primary returns
+promptly. The old WS-based drivers (`python_client.py`, `hivedriver.py`, and
+the shared `hive_protocol.py`) were removed — the WebSocket is reserved for the
+web GUI only; external drivers use HTTP through this CLI.
 
-`POST /hive/agent/wait` previously reported a **settled primary as `running`
-forever** because the primary prompt path never marks the in-memory state
-terminal. It now short-circuits on the authoritative graph-node status
-(primaries settle to `idle`, subagents to `done`), so the long-poll returns
-promptly for a finished primary. Do not reintroduce dependence on the
-in-memory `status` for completion detection.
-
-The old WS-based drivers (`python_client.py`, `hivedriver.py`, and the shared
-`hive_protocol.py`) were removed — external callers no longer maintain a
-WebSocket lifecycle; that is now reserved for the web GUI only.
-
-Drive-loop invariants preserved from the removed WS drivers (so reasoning
-patterns don't change):
-- Completion is detected by the settle signal (a settled node status from the
-  long-poll), not by mere liveliness — never treat a `running`/partial payload
-  as "finished".
-- Final text comes from `message_end` records, never from deltas or a glimpse.
-- A task targets one `id`; output is filtered to that `id` so other agents'
-  activity never leaks into the result.
+Drive-loop invariants:
+- Completion is the settle signal (a settled node status from the long-poll), never
+a `running`/partial payload.
+- Final text comes from `message_end`, never deltas or a glimpse.
+- A task targets one `id`; output is filtered to that `id`.
 
 ---
 

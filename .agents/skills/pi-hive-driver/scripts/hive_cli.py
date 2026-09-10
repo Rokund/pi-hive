@@ -1,7 +1,6 @@
-"""Reference Python client for driving a pi-hive over plain HTTP (no WebSocket).
+"""pi-hive driver CLI — drive a running pi-hive over plain HTTP (no WebSocket).
 
-This is THE SKILL-reference client (issue #12). It implements exactly what an
-AI agent driving the hive needs, over HTTP ONLY:
+This is THE tool (issue #12) for an AI agent to drive the hive over HTTP:
 
   * spawn a new primary conversation,
   * prompt / steer / follow_up / abort an agent,
@@ -368,36 +367,131 @@ class HiveClient:
 
 
 def demo() -> None:
-    """Minimal usage: drive a fresh primary with a short task.
+    """CLI entry point — the one tool for driving a pi-hive over HTTP.
 
-    Pass ``--host`` / ``--port`` (or set PI_HIVE_API_HOST / PI_HIVE_API_PORT)
-    to talk to a hive on a non-default API port — it is never hard-coded.
+    This is THE driver (not a "reference"/"demo" to adapt): every action has a
+    subcommand with concrete parameters that just works against the configured
+    hive. Subcommands:
+
+      drive      spawn (or target) an agent, send a task, block until it
+                 settles, print the answer.
+      spawn      start a NEW primary conversation.
+      prompt     send a task / continue an existing conversation.
+      steer      mid-stream guidance to a running agent.
+      abort      abort an agent.
+      wait       long-poll for an agent's turn to settle.
+      tree       list the agent tree.
+      agent      show one node.
+      glimpse    peek at an agent's live output.
+      questions  list the Q&A an agent asked (read-only).
+
+    Host/port are never hard-coded: pass ``--host``/``--port``/``--api-base`` or
+    set PI_HIVE_API_HOST / PI_HIVE_API_PORT / PI_HIVE_API_BASE.
     """
     import argparse
 
-    parser = argparse.ArgumentParser(description="pi-hive HTTP reference client demo")
+    parser = argparse.ArgumentParser(
+        prog="pi-hive-driver",
+        description="Drive a running pi-hive over HTTP.",
+    )
     parser.add_argument("--api-base", help="full base URL, e.g. http://host:port")
-    parser.add_argument("--host", default=None)
-    parser.add_argument("--port", type=int, default=None)
-    parser.add_argument("--prompt", default="Reply with exactly one short sentence about the Eiffel Tower.")
-    parser.add_argument("--wall-timeout", type=float, default=120.0)
-    args = parser.parse_args()
+    parser.add_argument("--host", default=None, help="hive API host (default 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=None, help="hive API port")
+    parser.add_argument("--json", action="store_true", help="print structured JSON output")
+    sub = parser.add_subparsers(dest="command", required=True)
 
+    p_drive = sub.add_parser("drive", help="send a task and block for the answer")
+    p_drive.add_argument("--prompt", required=True)
+    p_drive.add_argument("--id", help="target an existing agent; omit to spawn a new primary")
+    p_drive.add_argument("--cwd", default=None)
+    p_drive.add_argument("--wall-timeout", type=float, default=1800.0)
+
+    p_spawn = sub.add_parser("spawn", help="start a new primary conversation")
+    p_spawn.add_argument("--cwd", default=None)
+    p_spawn.add_argument("--agent", default=None, help="primary-eligible profile to run")
+    p_spawn.add_argument("--model", default=None)
+
+    p_prompt = sub.add_parser("prompt", help="send a task / continue a conversation")
+    p_prompt.add_argument("--id", required=True)
+    p_prompt.add_argument("--message", required=True)
+
+    p_steer = sub.add_parser("steer", help="mid-stream guidance to a running agent")
+    p_steer.add_argument("--id", required=True)
+    p_steer.add_argument("--message", required=True)
+
+    p_abort = sub.add_parser("abort", help="abort an agent")
+    p_abort.add_argument("--id", required=True)
+    p_abort.add_argument("--reason", default=None)
+
+    p_wait = sub.add_parser("wait", help="long-poll for an agent to settle")
+    p_wait.add_argument("--id", required=True)
+    p_wait.add_argument("--wait-time-ms", type=int, default=0)
+
+    sub.add_parser("tree", help="list the agent tree")
+
+    p_agent = sub.add_parser("agent", help="show one node")
+    p_agent.add_argument("--id", required=True)
+
+    p_glimpse = sub.add_parser("glimpse", help="peek at an agent's live output")
+    p_glimpse.add_argument("--id", required=True)
+    p_glimpse.add_argument("--n", type=int, default=1024)
+
+    p_questions = sub.add_parser("questions", help="list Q&A an agent asked (read-only)")
+    p_questions.add_argument("--id", required=True)
+
+    args = parser.parse_args()
     client = HiveClient(
         api_base=args.api_base,
         host=args.host,
         port=args.port,
     )
-    result = client.drive(
-        prompt=args.prompt,
-        cwd=None,
-        wall_timeout=args.wall_timeout,
-    )
-    print("agent_id:", result["agent_id"])
-    print("settled:", result["settled"])
-    print("status:", result["status"])
-    print("final_text:", result["final_text"])
-    print("frame_count:", result["frame_count"])
+
+    if args.command == "drive":
+        result = client.drive(
+            prompt=args.prompt,
+            agent_id=args.id,
+            cwd=args.cwd,
+            wall_timeout=args.wall_timeout,
+        )
+        _emit(args, result)
+    elif args.command == "spawn":
+        _emit(args, client.spawn(cwd=args.cwd, agent=args.agent, model=args.model))
+    elif args.command == "prompt":
+        client.prompt(args.id, args.message)
+        _emit(args, {"ok": True, "id": args.id})
+    elif args.command == "steer":
+        client.steer(args.id, args.message)
+        _emit(args, {"ok": True, "id": args.id})
+    elif args.command == "abort":
+        client.abort(args.id, reason=args.reason)
+        _emit(args, {"ok": True, "id": args.id})
+    elif args.command == "wait":
+        _emit(args, client.wait(args.id, args.wait_time_ms))
+    elif args.command == "tree":
+        _emit(args, {"tree": client.get_tree()})
+    elif args.command == "agent":
+        _emit(args, client.get_agent(args.id))
+    elif args.command == "glimpse":
+        _emit(args, client.agent_glimpse(args.id, n=args.n))
+    elif args.command == "questions":
+        _emit(args, {"questions": client.questions(args.id)})
+
+
+def _emit(args: Any, payload: Dict[str, Any]) -> None:
+    """Print a result: structured JSON with --json, else a compact human line."""
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, default=str))
+        return
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        print(f"ERROR: {payload.get('error')}")
+        return
+    if args.command == "drive":
+        print("agent_id:", payload.get("agent_id"))
+        print("settled:", payload.get("settled"))
+        print("status:", payload.get("status"))
+        print("final_text:", payload.get("final_text"))
+        return
+    print(json.dumps(payload, ensure_ascii=False, default=str))
 
 
 if __name__ == "__main__":
