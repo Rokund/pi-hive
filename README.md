@@ -21,6 +21,7 @@ When you ask an AI to write an agentic loop, have it reference the bundled **`pi
 - **Primary / subagent tree** — a root ("primary") spawns supervised subagents with a tree hierarchy.
 - **Full subagent lifecycle** — spawn, poll results, abort (cooperative — an RPC abort to the agent; it does not kill the process), steer a running agent mid-turn, follow up on a finished session, glimpse the live output tail.
 - **Liveness telemetry** — live output tail, moving `liveOutputChars` counter, live token/cost usage, phase labels, and per-agent event heartbeats.
+- **Inter-agent Q&A (read-only surface)** — agents may ask/answer questions along direct parent↔child edges (ADR-0001); an external driver can read the questions an agent asked (pending and recently answered, bounded) via `GET /api/agent/{id}/questions` to decide whether to intervene. The driver has read-only visibility; it does not synthesize answers.
 - **Per-agent tool & MCP allowlists** — each named agent profile gates which tools and which MCP servers (from `~/.pi/agent/mcp.json`) are visible; visibility is enforced at the hub, never on the MCP server itself (ADR-0002).
 - **Named agent profiles** — reusable, configurable profiles (`tester`, `coder`, `reviewer`, …) with per-agent model, concurrency ceiling, tools, skills and system prompts.
 - **LLM capability profiles** — structured metadata (context window, pricing, capabilities incl. vision, speed) injected to the primary so it can distinguish a "slow, working within limits" subagent from a "stuck" one.
