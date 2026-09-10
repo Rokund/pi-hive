@@ -1,15 +1,15 @@
 # Pi-Hive
 
-A self-hosted orchestrator that supervises [pi](https://github.com/earendil-works/pi) agent subprocesses as a tree of named agents — spawn, steer, abort, follow up on, and peek at them, over a WebSocket API and a web GUI.
+A self-hosted orchestrator that supervises [pi](https://github.com/earendil-works/pi) agent subprocesses as a tree of named agents — spawn, steer, abort, follow up on, and peek at them, over an HTTP API and a web GUI.
 
 Pi-Hive runs each agent as an isolated pi process, supervises its lifecycle (spawn / result / abort / steer / follow-up / glimpse), tracks its live output and token usage, and exposes two ports:
 
 - **Port 1 (Web GUI)** — a React dashboard over the agent tree (HTTP + WebSocket).
-- **Port 2 (API)** — an HTTP + WebSocket API for driving agents programmatically.
+- **Port 2 (API)** — an HTTP API for driving agents programmatically (the WebSocket here is reserved for the web GUI mirror; external drivers use HTTP).
 
 ## Use case: human-visible LLM calls within an agentic loop
 
-Inside an agentic loop, the usual way to use a model is to call the LLM directly from the loop's code — a black box to everyone else. Pi-Hive is an alternative way to make that LLM call: instead of a direct model call, the loop drives supervised pi agents through the hub's WebSocket API. Because those agents run as visible, supervised processes, a human can:
+Inside an agentic loop, the usual way to use a model is to call the LLM directly from the loop's code — a black box to everyone else. Pi-Hive is an alternative way to make that LLM call: instead of a direct model call, the loop drives supervised pi agents through the hub's HTTP API. Because those agents run as visible, supervised processes, a human can:
 
 - watch the working process live (output tail, tool calls, token/usage), and
 - intervene mid-turn — `steer` a running agent, abort it, or follow up — rather than fire-and-forget.
@@ -19,7 +19,7 @@ When you ask an AI to write an agentic loop, have it reference the bundled **`pi
 ## Features
 
 - **Primary / subagent tree** — a root ("primary") spawns supervised subagents with a tree hierarchy.
-- **Full subagent lifecycle** — spawn, poll results, abort (hard stop by default, see ADR-0001), steer a running agent mid-turn, follow up on a finished session, glimpse the live output tail.
+- **Full subagent lifecycle** — spawn, poll results, abort (cooperative — an RPC abort to the agent; it does not kill the process), steer a running agent mid-turn, follow up on a finished session, glimpse the live output tail.
 - **Liveness telemetry** — live output tail, moving `liveOutputChars` counter, live token/cost usage, phase labels, and per-agent event heartbeats.
 - **Per-agent tool & MCP allowlists** — each named agent profile gates which tools and which MCP servers (from `~/.pi/agent/mcp.json`) are visible; visibility is enforced at the hub, never on the MCP server itself (ADR-0002).
 - **Named agent profiles** — reusable, configurable profiles (`tester`, `coder`, `reviewer`, …) with per-agent model, concurrency ceiling, tools, skills and system prompts.
@@ -67,8 +67,10 @@ An AI agent can drive Pi-Hive end-to-end using only HTTP — use the bundled **`
 `hive/hive.config.json` (private — copy the tracked `hive.config.json.example`):
 
 - `server` — bind address and ports.
-- `primary` — the root agent profile.
-- `agents` — named subagent profiles.
+- `agents` — named agent profiles (each is an ordinary entry; the primary is
+  one such entry flagged `allow_as_primary: true`). The legacy top-level
+  `primary` block is **rejected** at load.
+- `default_primary` — the agent selected as the default primary.
 - `llm` — capability profiles keyed by model id, injected to the primary.
 
 The private `hive/hive.config.json` is git-ignored; only the `.example` is tracked. Env vars: `PI_HIVE_CWD`, `PI_HIVE_API_BASE`, `PI_HIVE_SUBAGENTS`.
