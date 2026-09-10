@@ -27,7 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hive.config import HiveConfig, load_config
-from hive.main import Hive
+from hive.main import Hive, _dedupe_capability_notes
 from hive.models import AgentProfile
 from hive.server import ApiContext, EventBroadcaster, create_api_app
 
@@ -423,6 +423,76 @@ def test_llm_capability_note_uses_actually_spawned_model():
     assert node3.profile.model == "model-y"
     assert "model=model-y" in node3.profile.systemPrompt
     assert "model=model-x" not in node3.profile.systemPrompt
+
+
+def test_primary_spawn_does_not_accumulate_capability_note():
+    # ticket #13 regression: make_primary_node previously appended the M9 note
+    # onto the SHARED registry profile (profile_by_name returns the live
+    # instance, not a copy), so every primary spawn added one more copy and a
+    # single node could carry the note tens of times. The note must now appear
+    # exactly once per node, and the configured registry profile must stay
+    # pristine across unlimited spawns.
+    raw = {
+        "server": _server(),
+        "agents": [_agent("a", model="model-x", allow_as_primary=True,
+                            systemPrompt="You are a primary.")],
+        "default_primary": "a",
+        "llm": [{"name": "model-x", "context_window": 100, "prices": "$",
+                  "capability": "c", "speed": "s"}],
+    }
+    cfg = build_config(raw)
+    hive = _make_hive(cfg)
+    for _ in range(5):
+        node = hive.make_primary_node()
+        assert node.profile.systemPrompt.count("LLM capability profile") == 1
+    # The shared registry profile is untouched: no injected note leaked into it.
+    registry_sp = cfg.profile_by_name("a").systemPrompt
+    assert registry_sp == "You are a primary."
+    assert "LLM capability profile" not in (registry_sp or "")
+
+
+def test_primary_spawn_reinjects_for_overridden_model_without_dup():
+    # Overriding the model must REPLACE (not append to) any prior note: the
+    # result carries exactly one note, for the ACTUAL model only.
+    raw = {
+        "server": _server(),
+        "agents": [_agent("a", model="model-x", allow_as_primary=True,
+                            systemPrompt="You are a primary.")],
+        "default_primary": "a",
+        "llm": [
+            {"name": "model-x", "context_window": 100, "prices": "$",
+             "capability": "no-vision", "speed": "fast"},
+            {"name": "model-y", "context_window": 200, "prices": "$$",
+             "capability": "vision", "speed": "slow"},
+        ],
+    }
+    hive = _make_hive(build_config(raw))
+    a = hive.make_primary_node()
+    b = hive.make_primary_node(model="model-y")
+    assert a.profile.systemPrompt.count("LLM capability profile") == 1
+    assert "model=model-x" in a.profile.systemPrompt
+    assert b.profile.systemPrompt.count("LLM capability profile") == 1
+    assert "model=model-y" in b.profile.systemPrompt
+    assert "model=model-x" not in b.profile.systemPrompt
+
+
+def test_dedupe_capability_notes_keeps_single_copy():
+    # Legacy persisted records can carry the note many times; restore dedupes
+    # to a single (first) copy and preserves surrounding base text.
+    dup = ("You are a primary.\n\n"
+           "LLM capability profile: model=m; ctx=1; price=$; cap=c; speed=s\n\n"
+           "LLM capability profile: model=m; ctx=1; price=$; cap=c; speed=s\n\n"
+           "LLM capability profile: model=m; ctx=1; price=$; cap=c; speed=s")
+    out = _dedupe_capability_notes(dup)
+    assert out is not None
+    assert out.count("LLM capability profile") == 1
+    assert out.startswith("You are a primary.")
+
+
+def test_dedupe_capability_notes_leaves_no_note_prompt_untouched():
+    clean = "Just a plain system prompt with no notes."
+    assert _dedupe_capability_notes(clean) == clean
+    assert _dedupe_capability_notes(None) is None
 
 
 # ---------------------------------------------------------------------------

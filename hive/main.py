@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -36,6 +37,67 @@ logger = logging.getLogger("hive.main")
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+# The M9 capability note injected into a primary's own system prompt always
+# starts with this marker and never spans a newline (LlmProfile.describe
+# returns a single line). It's used to make injection idempotent and to strip
+# duplicate copies left behind by the pre-#13 accumulation bug.
+_CAP_NOTE_RE = re.compile(r"(?m)^[ \t]*LLM capability profile:[^\r\n]*$")
+
+
+def _strip_capability_notes(system_prompt: Optional[str]) -> Optional[str]:
+    """Remove EVERY injected capability-note line from `system_prompt`.
+
+    Returns None when nothing remains. Runs of blank lines left by removed
+    notes are collapsed. A falsy/absent value is returned untouched.
+    """
+    if not system_prompt:
+        return system_prompt
+    cleaned = _CAP_NOTE_RE.sub("", system_prompt)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned or None
+
+
+def _inject_capability_note(system_prompt: Optional[str],
+                            note: Optional[str]) -> Optional[str]:
+    """Return `system_prompt` with EXACTLY ONE copy of the capability `note`.
+
+    Idempotent by construction: any pre-existing injected note(s) are stripped
+    first and replaced by a single copy of `note`, so calling repeatedly never
+    accumulates copies. When `note` is None, any stale injected note is removed
+    and the prompt is returned without one.
+    """
+    base = _strip_capability_notes(system_prompt)
+    if not note:
+        return base
+    base = (base or "").rstrip()
+    return (base + ("\n\n" if base else "") + note)
+
+
+def _dedupe_capability_notes(system_prompt: Optional[str]) -> Optional[str]:
+    """Collapse repeated injected capability notes to a single (first) copy.
+
+    Pre-#13 ``make_primary_node`` appended the M9 note onto the SHARED registry
+    profile, so records from a long-lived hive could carry the same note tens
+    of times. This keeps the first (authoritative) note and drops later
+    duplicates WITHOUT re-deriving from current config — the historical model
+    may no longer be described by today's ``llm`` entries.
+    """
+    if not system_prompt:
+        return system_prompt
+    seen = False
+    kept: List[str] = []
+    for line in system_prompt.splitlines():
+        if _CAP_NOTE_RE.match(line):
+            if seen:
+                continue
+            seen = True
+        kept.append(line)
+    if not seen:
+        return system_prompt
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    return cleaned or None
 
 
 class Hive:
@@ -121,6 +183,10 @@ class Hive:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("restore %s: bad profile snapshot (%s)", node_id, exc)
                 continue
+            # Pre-#13 records could persist the M9 note many times (an append-
+            # on-shared-profile bug). Collapse to a single copy so restore never
+            # re-introduces the inflated systemPrompt (ticket #13).
+            profile.systemPrompt = _dedupe_capability_notes(profile.systemPrompt)
             node = AgentNode(
                 id=node_id,
                 kind=rec.get("kind", "subagent"),
@@ -370,22 +436,27 @@ class Hive:
                           cwd: Optional[str] = None,
                           agent: Optional[str] = None) -> AgentNode:
         profile = self._resolve_primary_profile(agent)
+        # Always operate on a PRIVATE deep copy: _resolve_primary_profile hands
+        # back the SHARED registry instance (profile_by_name does NOT copy), so
+        # mutating it directly would bake the note into the registry config and
+        # accumulate one extra copy per primary spawn (ticket #13). Working on a
+        # copy keeps the configured profile pristine and every node independent.
+        profile = profile.model_copy(deep=True)
         # GUI model selection: override the configured default for this
         # conversation only (the node's own profile snapshot keeps it).
         if model:
-            profile = profile.model_copy(update={"model": model})
+            profile.model = model
         # M9: the primary should know its OWN LLM's real constraints (context
         # window, pricing, vision, speed) so it does not misjudge a slow-but-
         # legitimate subagent. Inject the structured capability profile derived
         # from the ACTUAL resolved model (after any `model` override above) into
         # its own system prompt. It never appears in PI_HIVE_SUBAGENTS, which
-        # only describes the subagents the primary can spawn. profile_by_name
-        # returns a fresh copy, so mutating it is safe.
+        # only describes the subagents the primary can spawn. `_inject_...` is
+        # idempotent, so the note appears exactly once regardless of how many
+        # times this runs or whether the base already carries (stale) copies.
         own_llm = self.config.llm_for_model(profile.model)
-        if own_llm is not None:
-            note = own_llm.describe()
-            base = profile.systemPrompt or ""
-            profile.systemPrompt = (base.rstrip() + ("\n\n" if base else "") + note)
+        note = own_llm.describe() if own_llm is not None else None
+        profile.systemPrompt = _inject_capability_note(profile.systemPrompt, note)
         return AgentNode(
             id=uuid.uuid4().hex,
             kind="primary",
