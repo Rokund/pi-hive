@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -356,6 +356,53 @@ def _build_api_response(command: str, payload: Dict[str, Any] | None = None,
     if error is not None:
         resp["error"] = error
     return resp
+
+
+# Bare `{ok,...}` dialect for HTTP-only drivers (issue #12 / #8).
+#
+# The WS command channel speaks the `{type:"response", command, success,
+# data?, error?}` envelope, whose `command`/`reqId` fields exist to correlate
+# commands over a multiplexed socket. Plain HTTP is request-response one-to-
+# one and never needs those fields, so the external-driving contract is a
+# SINGLE bare `{ok, ...}` dialect.  External callers opt in with the request
+# header `Accept: application/vnd.hive.bare+json`; the same handler endpoint
+# (shared logic) then returns the bare form instead of the envelope.  No
+# header means the call is treated as an unmarked consumer (GUI etc.) and
+# gets the legacy envelope unchanged — fully backwards compatible.
+BARE_ACCEPT = "application/vnd.hive.bare+json"
+
+
+def _wants_bare(request: Request) -> bool:
+    return BARE_ACCEPT in (request.headers.get("accept") or "")
+
+
+def _bare_of(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert an envelope `{type,command,success,data?,error?}` into the bare
+    `{ok, ...}` dialect for HTTP-only drivers.
+
+    The success flag becomes top-level `ok`; the envelope `data` dict (when
+    present) is merged into the body so a successful `get_tree` yields
+    `{ok, tree: [...]}`, an agent lookup yields `{ok, ...node}` etc. — the
+    same flattened style as `/hive/*`.  `error` is preserved for failures.
+    `type`/`command`/`reqId` are dropped (HTTP needs no correlation fields).
+    """
+    ok = envelope.get("success") is not False
+    body: Dict[str, Any] = {"ok": ok}
+    data = envelope.get("data")
+    if isinstance(data, dict):
+        body.update(data)
+    error = envelope.get("error")
+    if error is not None:
+        body["error"] = error
+    return body
+
+
+def _command(request: Request, response: Dict[str, Any]) -> Dict[str, Any]:
+    """Shared handler exit: return bare `{ok,...}` when the caller opted in via
+    the Accept header, else the legacy envelope unchanged."""
+    if _wants_bare(request):
+        return _bare_of(response)
+    return response
 
 
 def _resolve_agent(ctx: ApiContext, payload: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -696,16 +743,27 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
         return {"ok": True, "agents": ctx.graph.__len__()}
 
     @app.get("/api/tree")
-    async def api_get_tree() -> Dict[str, Any]:
-        return await _handle_command(ctx, "get_tree", None)
+    async def api_get_tree(request: Request) -> Dict[str, Any]:
+        return _command(request, await _handle_command(ctx, "get_tree", None))
 
     @app.get("/api/agent/{agent_id}")
-    async def api_get_agent(agent_id: str) -> Dict[str, Any]:
+    async def api_get_agent(request: Request, agent_id: str) -> Dict[str, Any]:
         # Resolving an agent by id is the GUI's "select/click" signal — lazily
         # materialize the persisted session if it isn't loaded yet.
         if ctx.ensure_loaded is not None and ctx.graph.has_node(agent_id):
             await ctx.ensure_loaded(agent_id)
-        return await _handle_command(ctx, "get_agent", {"agent": agent_id})
+        return _command(request, await _handle_command(ctx, "get_agent", {"agent": agent_id}))
+
+    @app.get("/api/agent/{agent_id}/questions")
+    async def api_agent_questions(agent_id: str) -> Dict[str, Any]:
+        """Read-only visibility for an external driver into the Q&A a given
+        agent ASKED (issue #9): pending first, then recently-answered, bounded
+        by the store's retention. Purely diagnostic — the driver never answers
+        here (no write path, per ADR-0001 rejected note).
+        """
+        if not ctx.graph.has_node(agent_id):
+            return {"ok": False, "questions": [], "error": f"unknown agent: {agent_id}"}
+        return {"ok": True, "questions": ctx.qa.asked_by(agent_id), "error": ""}
 
     @app.get("/api/agent/{agent_id}/events")
     async def api_agent_events(agent_id: str, since: int = 0) -> Dict[str, Any]:
@@ -811,32 +869,32 @@ def create_api_app(ctx: ApiContext) -> FastAPI:
         }
 
     @app.post("/api/prompt")
-    async def api_prompt(body: PromptIn) -> Dict[str, Any]:
-        return await _handle_command(
-            ctx, "prompt", body.model_dump(exclude_none=True)
+    async def api_prompt(request: Request, body: PromptIn) -> Dict[str, Any]:
+        return _command(
+            request, await _handle_command(ctx, "prompt", body.model_dump(exclude_none=True))
         )
 
     @app.post("/api/steer")
-    async def api_steer(body: SteerIn) -> Dict[str, Any]:
-        return await _handle_command(
-            ctx, "steer", body.model_dump(exclude_none=True)
+    async def api_steer(request: Request, body: SteerIn) -> Dict[str, Any]:
+        return _command(
+            request, await _handle_command(ctx, "steer", body.model_dump(exclude_none=True))
         )
 
     @app.post("/api/follow_up")
-    async def api_follow_up(body: FollowUpIn) -> Dict[str, Any]:
-        return await _handle_command(
-            ctx, "follow_up", body.model_dump(exclude_none=True)
+    async def api_follow_up(request: Request, body: FollowUpIn) -> Dict[str, Any]:
+        return _command(
+            request, await _handle_command(ctx, "follow_up", body.model_dump(exclude_none=True))
         )
 
     @app.post("/api/abort")
-    async def api_abort(body: AbortIn) -> Dict[str, Any]:
-        return await _handle_command(
-            ctx, "abort", body.model_dump(exclude_none=True)
+    async def api_abort(request: Request, body: AbortIn) -> Dict[str, Any]:
+        return _command(
+            request, await _handle_command(ctx, "abort", body.model_dump(exclude_none=True))
         )
 
     @app.post("/api/subscribe")
-    async def api_subscribe() -> Dict[str, Any]:
-        return await _handle_command(ctx, "subscribe", None)
+    async def api_subscribe(request: Request) -> Dict[str, Any]:
+        return _command(request, await _handle_command(ctx, "subscribe", None))
 
     @app.post("/api/primary/spawn")
     async def api_primary_spawn(body: SpawnPrimaryIn | None = None) -> Dict[str, Any]:

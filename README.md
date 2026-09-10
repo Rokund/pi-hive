@@ -58,9 +58,9 @@ python -m hive.main
 ```
 
 - Open the web GUI at `http://localhost:3000`.
-- Drive agents programmatically over the API WebSocket at `ws://localhost:3001/ws` (`prompt`, `steer`, `follow_up`, `abort`, `get_tree`, `subscribe`).
+- Drive agents programmatically over HTTP at `http://localhost:3001` (`POST /api/primary/spawn`, `/api/prompt`, `/api/steer`, `/api/follow_up`, `/api/abort`, `GET /api/tree`, long-poll `POST /hive/agent/wait`). External drivers use HTTP only; the WebSocket is reserved for the web GUI mirror.
 
-An AI agent can drive Pi-Hive end-to-end using only the WebSocket channel — see the bundled **`pi-hive-driver`** skill (`.agents/skills/pi-hive-driver/`) and its self-contained Python reference client (`scripts/python_client.py`).
+An AI agent can drive Pi-Hive end-to-end using only HTTP — see the bundled **`pi-hive-driver`** skill (`.agents/skills/pi-hive-driver/`) and its self-contained HTTP-only Python reference client (`scripts/http_client.py`).
 
 ## Configuration
 

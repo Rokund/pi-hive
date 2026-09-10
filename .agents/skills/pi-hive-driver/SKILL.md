@@ -2,38 +2,51 @@
 name: pi-hive-driver
 description: >-
   How to drive the pi-hive orchestrator from an AI agent loop using ONLY
-  its WebSocket channel. The hive is already running — you connect to
-  ws://127.0.0.1:3001/ws, issue {type:prompt|steer|follow_up|abort|get_tree}
-  commands, and read the agent output that streams back on the same socket.
-  Use this when you need to spawn an agent, give it a task, steer or abort it,
-  or read its tool calls and text output through pi-hive instead of a
-  human clicking the web GUI.
+  its HTTP channel. The hive is already running — you make one-shot HTTP
+  requests to the API (http://127.0.0.1:3001), issue prompt/steer/follow_up/
+  abort/get_tree commands, and read agent output by polling the event backlog
+  after the long-poll settle. Use this when you need to spawn an agent, give
+  it a task, steer or abort it, or read its output through pi-hive instead of
+  a human clicking the web GUI.
 ---
 
-# pi-hive — WebSocket Driver (for AI agents)
+# pi-hive — HTTP Driver (for AI agents)
 
-You are talking to a **running** pi-hive daemon. You do not start,
-configure, or maintain it — a human/supervisor handles that. You drive it
-**exclusively over its WebSocket API**. The hive spawns and supervises pi
-agents (each an isolated LLM "agent") and relays their output to you over the
-same socket.
+You are talking to a **running** pi-hive daemon. You do not start, configure,
+or maintain it — a human/supervisor handles that. You drive it **exclusively
+over its HTTP API**. The hive spawns and supervises pi agents (each an
+isolated LLM "agent") and answers your HTTP requests with the results.
 
-> Connect to `ws://127.0.0.1:3001/ws` (Port 2, the API WebSocket).
-> Port 1 (`ws://127.0.0.1:3000/ws`) is only the GUI mirror — you don't need it.
+> Base URL: `http://127.0.0.1:3001` by default (Port 2, the API); the port is
+> **configurable** and never hard-coded in the reference client — pass `host`/`port`
+> (or `api_base`) to `HiveClient`, or set `PI_HIVE_API_HOST` / `PI_HIVE_API_PORT` /
+> `PI_HIVE_API_BASE`. Port 1
+> (`http://127.0.0.1:3000`) is only the web **GUI**, whose real-time view runs
+> over a WebSocket mirror — you never touch a socket. The hive keeps a
+> WebSocket only for that GUI; external drivers use HTTP only, with no
+> connection lifecycle to maintain (each request is self-contained).
 
-> **Writing this as code?** A self-contained, WS-only **Python reference client**
-> lives at `scripts/python_client.py`. It implements the exact protocol
-> below (bare-prompt spawn with `cwd`, prompt/steer/follow_up/abort, `get_tree`,
-> completing on `agent_settled`, reading `message_end` not deltas, deduped tool
-> calls) with zero daemon/HTTP knowledge — copy it or read it for the correct
-> reasoning pattern for any language. Only dependency: `websocket-client`.
+> **Writing this as code?** A self-contained, HTTP-only **Python reference
+> client** lives at `scripts/http_client.py`. It implements the exact protocol
+> below (spawn via `/api/primary/spawn`, prompt/steer/follow_up/abort, bare
+> `{ok,...}` dialect, long-poll `/hive/agent/wait` completion, reading
+> `message_end` from the event backlog) with only Python's stdlib (`urllib`) —
+> no `requests`, no `httpx`, no `websocket-client`. Copy it or read it for the
+> correct reasoning pattern for any language.
+
+Every `/api` command endpoint returns the **bare `{ok, ...}`** dialect (no WS
+envelope) when called with the request header
+`Accept: application/vnd.hive.bare+json`. The reference client always sends
+that header; you should too. Without it, the endpoint returns the legacy
+`{type:"response",...}` envelope — both call the same handler, but for an
+external driver the bare form is the contract.
 
 ---
 
 ## 1. What you can and can't do
 
-You talk to agents via **commands** and read their output via the **event
-stream** (both on the same socket).
+You talk to agents via **commands** and read their output via **polling the
+event backlog** (`GET /api/agent/{id}/events`).
 
 - Agents are `primary` (a conversation root) or `subagent` (nested under a
   primary). Each has a stable `id` — the only handle you should reuse.
@@ -42,170 +55,159 @@ stream** (both on the same socket).
 - **Subagents are spawned BY the primary**, not by you. When a primary decides
   it needs help it calls its own `subagent_spawn` / `subagent_result` /
   `subagent_followup` / `subagent_abort` / `subagent_steer` / `subagent_glimpse`
-  tools. You observe that machinery through the event stream; you don't run the
-  subagents yourself. Note `subagent_glimpse` (a *peek* at the tail of what a
-  subagent is producing — including tool-call arguments as they stream) is
-  HTTP-only today; there is no WS command for it.
+  tools. You observe and manage the tree through `get_tree`, but you don't run
+  the subagents yourself. `subagent_glimpse` is HTTP-only; you can use the same
+  endpoint (`/hive/agent/glimpse`) to peek at ANY agent.
 - **The hive does not do the "thinking."** It routes your commands into each
-  agent's stdin and forwards every event (text deltas, tool calls,
-  settlement) back out tagged with `agentId`. It is memory-efficient: settled
-  / idle agents are reclaimed and restarted on demand, so an idle `id` still
-  works — it just may take a moment to come back.
+  agent and records every event (text, tool calls, settlement) into a bounded
+  per-agent transcript log you read back over HTTP. It is memory-efficient:
+  settled / idle agents are reclaimed and restarted on demand, so an idle `id`
+  still works — it just may take a moment to come back.
 
 ### Ground rules
-- A **`prompt` with no `agentId` always creates a NEW primary conversation.**
-  To continue an existing one you MUST pass its `agentId`.
+- Spawn a NEW primary with `POST /api/primary/spawn`; it returns the new `id`.
+  To **continue** an existing one, target its `agent` id explicitly.
 - **`cwd` is fixed at spawn time.** It is honored only when a new primary is
-  being created (a bare `prompt` without `agentId`). A later `prompt`/`steer`
-  that carries an `agentId` ignores `cwd` — an agent's `read`/`bash`/`edit`
-  tools always run relative to the directory it was launched in. Omit `cwd` to
-  use the hive's configured default working directory.
+  created (`/api/primary/spawn`). A later `prompt`/`steer` targeting an existing
+  `id` ignores `cwd` — an agent's `read`/`bash`/`edit` tools always run
+  relative to the directory it was launched in. Omit `cwd` to use the hive's
+  configured default working directory.
 
 ---
 
-## 2. Commands
+## 2. Commands (all HTTP, all bare `{ok,...}`)
 
-Every message you send is a JSON object with a `type`. The hive answers with
-`{type:"response", command:..., success:...}` and, in parallel, pushes
-broadcast event frames on the same socket.
+Every command below is a **one-shot HTTP request**. There is no persistent
+connection, no socket to keep open, and no response correlation problem — a
+request↔response pair is naturally one-to-one, so no `reqId` is needed (the WS
+channel's correlation ids never appear here).
 
-**Correlation (`reqId`, recommended):** every command may carry an optional
-`"reqId": "<string or number>"`. The response frame echoes it back verbatim
-(`reqId` in the `{type:"response"}` object) and omits the key entirely when
-you didn't send one. Send a **unique `reqId` per command and match
-responses to requests by `reqId`, never by arrival order** — commands may
-complete out of order (e.g. concurrent prompts of different duration), so
-order-based matching is unreliable. This covers every command on every
-response path, including error responses.
+All `POST` bodies are JSON. The `/api` command endpoints honor the
+`Accept: application/vnd.hive.bare+json` header.
 
-### 2.1 Spawn a new conversation with a task
-```json
-{ "type": "prompt", "text": "Investigate the height of the Eiffel Tower and reply briefly." }
+### 2.1 Spawn a new conversation
+
+```http
+POST /api/primary/spawn
+Content-Type: application/json
+
+{ "label": "optional", "model": "optional", "cwd": "/optional/abs/path", "agent": "optional-profile" }
 ```
-- No `agentId` → the hive spawns a fresh primary to run it. The new `id` shows
-  up in the next `hive:agent_updated` / `hive:tree` frame.
-- `cwd` (optional absolute path) sets that primary's working directory.
-- **Spawn by profile:** an optional `"agent": "<profile-name>"` on a bare
-  prompt (no `agentId`) makes the fresh primary run THAT agent profile
-  instead of the configured `default_primary` — e.g.
-  `{ "type": "prompt", "text": "...", "agent": "coder2" }`. The profile must
-  exist and be primary-eligible, otherwise the command fails with a clear
-  error and NO node is created. When `agent` instead matches an EXISTING
-  node id it targets that conversation (the long-standing alias), so
-  profile-spawn only kicks in for names that are not node ids.
-  **The same behavior applies to the HTTP `POST /api/prompt` route** — it
-  shares the same dispatch path, so `agent` naming a profile there also
-  spawns a new primary on that profile.
+- Returns the bare `{ok: true, id: "<new-primary-id>", model: ..., error: ""}`.
+- `cwd` (optional absolute path) sets the new primary's working directory.
+- **Spawn by profile:** an optional `agent: "<profile-name>"` makes the new
+  primary run THAT agent profile instead of the configured `default_primary`.
+  The profile must exist and be primary-eligible, otherwise it fails with a
+  clear error and NO node is created.
 
-### 2.2 Continue / steer an existing agent
-```json
-{ "type": "prompt",    "agentId": "<id>", "text": "Now also compare two more countries." }
-{ "type": "steer",     "agentId": "<id>", "text": "Wait, focus on the sources, not speculation." }
-{ "type": "follow_up", "agentId": "<id>", "text": "Summarize in 3 bullets." }
+### 2.2 Send / continue / steer / follow-up
+
+```http
+POST /api/prompt      { "agent": "<id>", "message": "..." }   # send / continue
+POST /api/steer       { "agent": "<id>", "message": "..." }   # mid-stream nudge
+POST /api/follow_up   { "agent": "<id>", "message": "..." }   # queued until finish
 ```
-- `prompt` with an `agentId` = continue that conversation (lazily restored if idle).
-- `steer` = mid-stream guidance to a **running** agent (the agent-facing
-  `subagent_steer` tool reports `status:"skipped", delivered:false` for a
-  settled target; the thin WS `steer` relay just forwards, so prefer steering
-  agents you know are running).
+- `prompt` on an existing `id` = continue that conversation (lazily restored if idle).
+- `steer` = mid-stream guidance to a **running** agent (it can't reach a
+  settled target; prefer steering agents you know are running).
 - `follow_up` = queued until the agent finishes; on an **idle** agent use `prompt`.
+- The bare response is `{ok: true, error: ""}` on success.
 
 ### 2.3 Abort
-```json
-{ "type": "abort", "agentId": "<id>", "reason": "time budget exceeded", "by": "external" }
+```http
+POST /api/abort   { "agent": "<id>", "reason": "time budget exceeded" }
 ```
 - Aborting an already done/idle/aborted/failed agent is a no-op.
 - Driver-level abort is **cooperative** (an RPC abort to that agent; it does
   not kill the process — only the primary's `subagent_abort` tool hard-stops a
-  subagent). Once aborted, a node stays **`aborted` / terminal**: the settle
-  event that follows an aborted run does NOT flip it back to `done`.
+  subagent). Once aborted, a node stays **`aborted` / terminal** — the settle
+  that follows an aborted run does NOT flip it back to `done`.
 
 ### 2.4 Query
-```json
-{ "type": "get_tree" }                        // data.tree = all nodes
-{ "type": "get_agent", "agent": "<id>" }       // data = one node
-{ "type": "subscribe" }                        // ack; events already flow anyway
+```http
+GET /api/tree                          # bare {ok, tree: [...]} — all nodes
+GET /api/agent/{id}                    # bare {ok, ...node} — one node
+GET /api/agent/{id}/questions          # bare {ok, questions: [...]} — read-only Q&A (issue #9)
 ```
+- `/api/agent/{id}` lazily materializes a persisted-but-unloaded session (the
+  "select/click" signal), so a lookup may briefly take a moment on a cold id.
+- `/api/agent/{id}/questions` is **read-only** visibility into the questions an
+  agent ASKED (pending first, then recently answered, bounded by retention).
+  The driver never answers here — it reads to decide whether to intervene.
 
-### 2.5 Peek at an agent's live output (optional, HTTP only)
-There is no WS command for this; the hive exposes it as
-`POST http://127.0.0.1:3001/hive/agent/glimpse` with body
-`{"id": "<agent_id>", "n": <int, clamped to [1, 1024]>}`. It works for ANY
-agent — subagents and the primary alike. The primary calls it for its own
-subagents through `subagent_glimpse`; a driver that wants the same view
-out-of-band can use the stdlib-HTTP helper `HiveClient.subagent_glimpse()` in
-`scripts/python_client.py` (urllib — no new dependency; it still POSTs to the
-legacy `/hive/subagent/glimpse` alias, which remains). The response carries
+### 2.5 Peek at an agent's live output (optional)
+```http
+POST /hive/agent/glimpse   { "id": "<agent_id>", "n": <int, clamped to [1,1024]> }
+```
+Works for ANY agent — subagents and the primary alike. The response carries
 `status`, `phase`, `complete`, `truncated`, `totalChars`, `text`; treat
 `complete:false` as a *live fragment*, never a final answer. Also note:
 - `complete` is the authoritative "is this a final answer?" signal; rely on it.
   `status` is a reference label only — primaries settle to `idle` while
   subagents settle to `done`, and it can briefly disagree with the live state
   (e.g. at the moment of an abort), so do not use `status` alone to judge
-  completeness. The WS `agent_settled` event is self-describing: its
-  `settled` block carries `{kind, status, terminal}` computed by the hive
-  after the settle, so drivers never need to memorize (or round-trip
-  `get_tree` for) the idle-vs-done convention.
+  completeness.
 - `totalChars` is a monotonic per-process counter of everything streamed since
-  the process started (the same number as `subagent_result`'s progress
-  `liveOutputChars`); it is NOT the length of the returned `text` and is never
+  the process started; it is NOT the length of the returned `text` and is never
   reset between turns.
 - `truncated:true` only means the 8KB tail window is longer than `n` — with a
-  settled answer it is the normal case, NOT a sign the answer is cut off. The
-  FULL final text is only available from the WS `message_end` event or
+  settled answer it is normal, NOT a sign the answer is cut off. The FULL final
+  text is only available from the event backlog's `message_end` (see §3) or
   `subagent_result`'s `result.finalText`, never from a glimpse.
 
-### 2.6 Wait for an agent to settle (HTTP-only, no sleep loops)
-If you drive pi-hive over plain HTTP (no persistent WebSocket), do NOT
-sleep-poll `GET /api/agent/{id}` to detect that an agent finished its turn —
-use the long-poll `POST http://127.0.0.1:3001/hive/agent/wait` with body
-`{"id": "<agent_id>", "wait_time": <ms>}` (default 0 = return current state
-immediately). It works for primaries AND subagents: a settled or unloaded
-agent (idle/done/failed/aborted) returns its current node status + result
-payload at once (never waking or materializing it); a still-running agent
-blocks up to `wait_time` and returns the result the moment it settles, or
-`{ok:true, id, status:"running", progress:{...}}` with anti-stall signals
-(`recentlyActive`, `lastEventAgeMs`, `streaming`, `phase`, optional
-`liveOutputChars`/`usage`) if the bound elapses first. Re-issue the call on a
-`running` response to keep waiting. Unknown ids return `{ok:false, error}`.
+### 2.6 Wait for an agent to settle (long-poll — the ONLY sanctioned way)
+Do **NOT** sleep-poll `GET /api/agent/{id}` to detect that an agent finished
+its turn. Use the long-poll:
+```http
+POST /hive/agent/wait   { "id": "<agent_id>", "wait_time": <ms> }
+```
+- `wait_time: 0` returns the current state immediately.
+- It works for primaries AND subagents: a settled or unloaded agent
+  (idle/done/failed/aborted) returns its current node status + result payload
+  at once (never waking or materializing it); a still-running agent blocks up
+  to `wait_time` and returns the result the moment it settles, or
+  `{ok:true, id, status:"running", progress:{...}}` with anti-stall signals
+  (`recentlyActive`, `lastEventAgeMs`, `streaming`, `phase`, optional
+  `liveOutputChars`/`usage`) if the bound elapses first. **Re-issue the call**
+  on a `running` response to keep waiting. Unknown ids return `{ok:false, error}`.
 
 ---
 
-## 3. Reading output (the event stream)
+## 3. Reading output (the event backlog)
 
-Agent output arrives as **event frames**, separate from command responses:
-```json
-{ "type": "hive:event", "agentId": "<id>", "seq": 123,
-  "event": { "type": "message_update" | "message_end" | "tool_execution_*" | "agent_settled" | ... } }
-{ "type": "hive:tree", "tree": [...] }
-{ "type": "hive:agent_updated", "agent": {...} }
-{ "type": "hive:error", "message": "..." }
+There is no live event stream for external drivers; the hive keeps a bounded
+in-memory transcript log per agent and you read it back:
+```http
+GET /api/agent/{id}/events?since=<lastSeq>
 ```
-Useful node fields: `id`, `kind` (`primary`|`subagent`), `name`, `parentId`,
-`status`, `createdAt`, `lastResult{...}`.
+- Returns `{ok, agentId, events: [...], latest: <seq>}`. `since` is the last
+  `seq` you applied (0 = all). `latest` is the newest seq in the batch — record
+  it and use it as `since` on the next read to avoid re-fetching.
+- Each `event` in the list is a `hive:event`-shaped record with an `event.type`:
+  - `message_update` — streamed deltas (**not cumulative**).
+  - `message_end` — the **authoritative** final text of a turn; use this, not deltas.
+  - `tool_execution_*` — a tool invocation on that node.
+  - `turn_end` / `agent_settled` — lifecycle boundaries / the agent stopped.
+- Treat `message_end` + a completion signal (node status from `/hive/agent/wait`
+  or `/api/agent/{id}`) as "the turn ended" before issuing the next command.
 
-Inside `hive:event.event`:
-- `message_update` — streamed deltas (**not cumulative**).
-- `message_end` — the **authoritative** final text of a turn; use this, not deltas.
-- `tool_execution_start/update/end` — a tool invocation on that node.
-- `turn_end` / `agent_settled` — lifecycle boundaries / the agent stopped.
-- `subagent_spawned` — that node spawned a child; find it in the tree by `parentId`.
-
-Treat `message_end` + a completion signal (node status, or `agent_settled`) as
-"the turn ended" before issuing the next command.
+The reference client's `drive()` hides most of this: it spawns, sends the task,
+long-polls `/hive/agent/wait` until settled, then pulls the `message_end`
+texts from the event backlog.
 
 ---
 
 ## 4. Traps (read before driving)
 
-1. **A bare `prompt` forks a new conversation every time.** Track `id`s; a
-   bare prompt never continues the previous one.
+1. **Spawn is explicit.** `POST /api/primary/spawn` always creates a NEW
+   primary; it never continues an old one. To continue, target the existing
+   `id` via `/api/prompt`.
 2. **Read `message_end`, not `message_update` deltas**, for final text.
 3. **Idle reaping is real.** A settled agent may be reclaimed and silently
    restarted on the next command to its `id`. `loaded=false` is not "lost" —
    it means a one-time restart latency.
 4. **`follow_up` is a queue for running agents.** To continue an idle agent
-   use `prompt` with the explicit `agentId`.
+   use `prompt` with the explicit `agent` id.
 5. **Only allowed subagent names spawn.** If the primary calls
    `subagent_spawn(name)` with a name outside its allowlist it gets
    `{ok:false, error:"not allowed"}`. Allowed names are configured per parent
@@ -218,88 +220,72 @@ Treat `message_end` + a completion signal (node status, or `agent_settled`) as
    the primary authors these, keep them as natural next-step instructions, not
    "ignore your instructions" (which models may mistake for a prompt injection).
 8. **Working ≠ stalled.** A subagent can spend a long time thinking or running
-   tools; the `subagent_result` `progress` block is the honest signal only via
-   its event-layer fields: `recentlyActive` (true while events are arriving),
-   `lastEventAgeMs`, `streaming` and `phase` (`thinking` / `generating` /
-   `toolcalling` / `tool_running`). The numeric fields are OPTIONAL and appear
-   only once they carry information — `liveOutputChars` once the model has
-   streamed output, `usage` once the provider reports a non-zero counter — so
-   a healthy-but-quiet subagent (silent TTFT, long tool runs, local endpoints
-   that report usage only at completion) legitimately shows neither. Absence is
-   NOT a stall. Do not force-stop a primary just because a subagent it spawned
-   has gone quiet for a while — if you must look, watch that subagent's own
-   event stream (thinking deltas, tool execution) rather than guessing from
-   silence. `sessionBytes` is gone; rely on the fields above, not file-size
-   heuristics.
+   tools; the `/hive/agent/wait` and `/hive/agent/glimpse` `progress` blocks are
+   the honest signal only via their event-layer fields: `recentlyActive` (true
+   while events are arriving), `lastEventAgeMs`, `streaming` and `phase`
+   (`thinking` / `generating` / `toolcalling` / `tool_running`). The numeric
+   fields are OPTIONAL and appear only once they carry information —
+   `liveOutputChars` once the model has streamed output, `usage` once the
+   provider reports a non-zero counter — so a healthy-but-quiet subagent
+   (silent TTFT, long tool runs, local endpoints that report usage only at
+   completion) legitimately shows neither. Absence is NOT a stall. Do not
+   force-stop a primary just because a subagent it spawned has gone quiet — if
+   you must look, `GET /api/agent/{id}/events` on that subagent rather than
+   guessing from silence.
+9. **You never maintain a socket.** Every command is a self-contained HTTP
+   request. If a request times out, re-issue the long-poll wait — do not build
+   any reconnect/lifecycle machinery.
 
 ---
 
 ## 5. A minimal safe loop
 
-1. `{type:"get_tree"}` to see what exists (or start fresh).
-2. Create work: `{type:"prompt", text:"..."}`; capture the new primary's `id`.
-3. Read `hive:event` frames; accumulate `message_end` text for that `id`; watch
-   `tool_execution_*` only if you need to know which tools it used.
-4. To redirect: `{type:"steer", agentId:"<id>", text:"..."}`.
-5. When done or out of budget: `{type:"abort", agentId:"<id>", ...}`.
-6. For parallel work, hold each primary's `id` and target every command at it
-   explicitly.
+1. `GET /api/tree` to see what exists (or start fresh).
+2. Create work: `POST /api/primary/spawn` (capture the new `id`), then
+   `POST /api/prompt` with that `id` and the task.
+3. Long-poll `POST /hive/agent/wait {id}` repeatedly until status ≠ `running`.
+4. Read `GET /api/agent/{id}/events?since=...` and keep every `message_end`
+   text for that `id`; watch `tool_execution_*` only if you need to know which
+   tools it used.
+5. To redirect: `POST /api/steer {agent, message}`.
+6. When done or out of budget: `POST /api/abort {agent, reason}`.
+7. For parallel work, hold each primary's `id` and target every command at it
+   explicitly (independent HTTP requests, so no cross-contamination).
 
 ---
 
-## 6. Async / daemon variant (harness-friendly): `scripts/hivedriver.py`
+## 6. Reference client
 
 The working directory here is this skill's directory (`.agents/skills/pi-hive-driver/`);
 `scripts/...` paths below are relative to it — from the repo root that is
 `.agents/skills/pi-hive-driver/scripts/...`.
 
-`python_client.py` (§above) is a **blocking, single-shot** driver: one call
-holds the socket for the whole turn, so the outer agent can't steer mid-turn
-or do other work while a long turn runs. For an agent harness where each tool
-call is a fresh process, `scripts/hivedriver.py` is the async variant: a
-persistent daemon that owns the socket and accepts commands over a FIFO,
-streaming JSON-lines to a log. Its protocol correctness is **not re-implemented**
-and not merely "copied" from `python_client` — both drivers share the SAME
-frame-folding and spawn-discovery logic in `scripts/hive_protocol.py`
-(completion gated on `agent_settled` behind the ack barrier, `message_end` not
-deltas, target filtering, bare-prompt spawn discovery, tool dedupe, fail-fast
-on drop), so they cannot drift apart on invariants.
+`scripts/http_client.py` is the single, HTTP-only reference client (issue #12):
+- `HiveClient(host="127.0.0.1", port=3001)` (or `api_base=...`, or the
+  `PI_HIVE_API_HOST` / `PI_HIVE_API_PORT` / `PI_HIVE_API_BASE` env vars) — the
+  API port is configurable (`hive.config.json` -> `server.apiPort`), so it is
+  never hard-coded.
+- Methods: `spawn`, `prompt`, `steer`, `follow_up`, `abort`, `wait`, `drive`,
+  `get_tree`, `get_agent`, `questions`, `agent_glimpse`, `check_online`.
+- `drive(prompt, agent_id=None, cwd=None, wall_timeout=1800)` is the blocking
+  complete-turn driver: it spawns (if no `agent_id`), sends the task,
+  long-polls `/hive/agent/wait` until the agent settles, then pulls the
+  `message_end` transcripts from the event backlog. It raises `HiveError` on
+  transport/protocol failure instead of busy-spinning.
+- Only dependency: Python's stdlib `urllib`. No third-party package.
 
-Unlike the single-shot client, the daemon tracks **many concurrent turns**:
+The old WS-based drivers (`python_client.py`, `hivedriver.py`, and the shared
+`hive_protocol.py`) were removed — external callers no longer maintain a
+WebSocket lifecycle; that is now reserved for the web GUI only.
 
-* Frames stream for EVERY agent on the socket; the daemon routes each frame to
-the turn whose agent id it carries, so different in-flight agents never
-contaminate each other's transcript or settlement.
-* Several **bare prompts** (spawns) may be in flight at once. New primary ids
-are disambiguated by spawn order plus a claimed-id set — each brand-new id is
-assigned to the oldest unresolved spawn whose pre-prompt tree snapshot did not
-already contain it, and never assigned twice. Distinct spawns get distinct ids
-and are driven independently.
-* The ack barrier is **per-turn** and attributed by `reqId` (each command's
-unique `reqId` is echoed verbatim by the server — SKILL.md §2), so a stale
-signal from an earlier conversation on the same agent can never complete a new
-turn. At most **one in-flight turn per agent id** stays the rule; a second
-prompt to a busy agent returns an immediate `busy` ack.
-
-Usage (daemon):
-```
-python3 scripts/hivedriver.py --daemon --ws ws://127.0.0.1:3001/ws --fifo /tmp/hd.in --log /tmp/hd.log
-```
-Commands (one JSON object per line on the FIFO):
-- `{"op":"prompt","text":...,"agentId":?, "cwd":?, "label":?}` — launch a turn,
-  returns a `cmdId` **immediately** (+ the discovered `agentId` for a bare spawn;
-  a bare prompt to a busy agent returns `busy`, and multiple distinct spawns
-  may run concurrently).
-- `{"op":"steer"|"follow_up"|"abort","agentId":...,"text"|...}` — side-channel controls.
-- `{"op":"status","cmdId":...}` — non-blocking structured status (cached after settle).
-- `{"op":"wait","cmdId":...,"timeout_s":N}` — block up to N in the daemon for a
-  structured result; safe to call repeatedly, never forces the agent to parse
-  raw log JSON.
-- `{"op":"get_tree"}`, `{"op":"ping"}` (reports all in-flight `cmdId`s).
-
-Do not break: one in-flight turn per agent id keeps that agent's ack barrier
-airtight; `reqId` (never arrival order) attributes acks; steer/abort/follow_up
-stay free side-channels.
+Drive-loop invariants preserved from the removed WS drivers (so reasoning
+patterns don't change):
+- Completion is detected by the settle signal (a settled node status from the
+  long-poll), not by mere liveliness — never treat a `running`/partial payload
+  as "finished".
+- Final text comes from `message_end` records, never from deltas or a glimpse.
+- A task targets one `id`; output is filtered to that `id` so other agents'
+  activity never leaks into the result.
 
 ---
 

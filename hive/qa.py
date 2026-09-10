@@ -133,6 +133,23 @@ class QuestionStore:
         pending.sort(key=lambda r: r["askedAt"])
         return pending
 
+    def asked_by(self, frm: str, max_recent_answered: int = 100) -> List[Dict[str, Any]]:
+        """Read-only listing of every question ASKED BY ``frm`` (issue #9):
+        pending first (oldest first), then recently answered (most recent
+        first), bounded by ``max_recent_answered`` on the answered slice.
+
+        Intended for an external HTTP-only driver to see the in-flight /
+        recently-settled questions of its own agents so it can decide whether
+        to intervene. Purely a read — the store is never mutated here.
+        """
+        with self._lock:
+            mine = [dict(r) for r in self._questions.values() if r["from"] == frm]
+        pending = [r for r in mine if r["status"] == "pending"]
+        answered = [r for r in mine if r["status"] == "answered"]
+        pending.sort(key=lambda r: r["askedAt"])
+        answered.sort(key=lambda r: r["answeredAt"], reverse=True)
+        return pending + answered[:max_recent_answered]
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._questions)
