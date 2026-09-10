@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -74,6 +75,21 @@ def _req_json(url: str, *, method: str = "GET", body: Any = None,
         raise HiveError(f"{method} {url}: invalid JSON response: {exc}") from exc
 
 
+def _require_ok(obj: Any, context: str) -> Dict[str, Any]:
+    """Fail loudly when a bare `{ok, ...}` response reports a failure.
+
+    The external-driving dialect is bare `{ok,...}`; a false `ok` means the
+    action failed server-side even though the HTTP request succeeded. Collapse
+    that signal into a single `HiveError` so no caller silently proceeds on a
+    failed action (this was a real gap: several paths returned empty/ok results
+    on server-side failure).
+    """
+    if not isinstance(obj, dict) or obj.get("ok") is not True:
+        error = obj.get("error") if isinstance(obj, dict) else None
+        raise HiveError(f"{context}: {error or 'server did not report ok'}")
+    return obj
+
+
 class HiveClient:
     """HTTP-only driver for one hive. Thread-safety not guaranteed.
 
@@ -114,17 +130,19 @@ class HiveClient:
     # -------------------------------------------------------------------- tree
     def get_tree(self) -> List[Dict[str, Any]]:
         """Current node tree (bare `/api/tree`, `{ok, tree: [...]}`)."""
-        body = _req_json(f"{self.api_base}/api/tree", timeout=self.timeout)
-        if not body.get("ok"):
-            raise HiveError(f"get_tree failed: {body.get('error')}")
-        return body.get("tree", [])
+        _require_ok(
+            _req_json(f"{self.api_base}/api/tree", timeout=self.timeout),
+            "get_tree",
+        )
+        return _req_json(f"{self.api_base}/api/tree", timeout=self.timeout).get("tree", [])
 
     def get_agent(self, agent_id: str) -> Dict[str, Any]:
         """One node's current state (bare `/api/agent/{id}`, `{ok, ...node}`)."""
-        body = _req_json(f"{self.api_base}/api/agent/{agent_id}", timeout=self.timeout)
-        if not body.get("ok"):
-            raise HiveError(f"get_agent {agent_id} failed: {body.get('error')}")
-        return body
+        resp = _require_ok(
+            _req_json(f"{self.api_base}/api/agent/{agent_id}", timeout=self.timeout),
+            f"get_agent {agent_id}",
+        )
+        return resp
 
     # ------------------------------------------------------------------- spawn
     def spawn(self, *, cwd: Optional[str] = None, agent: Optional[str] = None,
@@ -142,12 +160,15 @@ class HiveClient:
             payload["agent"] = agent
         if model is not None:
             payload["model"] = model
-        body = _req_json(
-            f"{self.api_base}/api/primary/spawn", method="POST",
-            body=payload, timeout=self.timeout,
+        body = _require_ok(
+            _req_json(
+                f"{self.api_base}/api/primary/spawn", method="POST",
+                body=payload, timeout=self.timeout,
+            ),
+            "spawn",
         )
-        if not body.get("ok") or not body.get("id"):
-            raise HiveError(f"spawn failed: {body.get('error')}")
+        if not body.get("id"):
+            raise HiveError("spawn: server returned ok but no agent id")
         return body
 
     # ------------------------------------------------------------ send/turn cmds
@@ -157,42 +178,46 @@ class HiveClient:
         payload: Dict[str, Any] = {"agent": agent_id, "message": message}
         if images:
             payload["images"] = images
-        body = _req_json(
-            f"{self.api_base}/api/prompt", method="POST", body=payload,
-            timeout=self.timeout,
+        _require_ok(
+            _req_json(
+                f"{self.api_base}/api/prompt", method="POST", body=payload,
+                timeout=self.timeout,
+            ),
+            "prompt",
         )
-        if not body.get("ok"):
-            raise HiveError(f"prompt failed: {body.get('error')}")
 
     def steer(self, agent_id: str, message: str) -> None:
         """Mid-stream guidance to a running agent."""
-        body = _req_json(
-            f"{self.api_base}/api/steer", method="POST",
-            body={"agent": agent_id, "message": message}, timeout=self.timeout,
+        _require_ok(
+            _req_json(
+                f"{self.api_base}/api/steer", method="POST",
+                body={"agent": agent_id, "message": message}, timeout=self.timeout,
+            ),
+            "steer",
         )
-        if not body.get("ok"):
-            raise HiveError(f"steer failed: {body.get('error')}")
 
     def follow_up(self, agent_id: str, message: str) -> None:
         """Queue a follow-up (delivered once the agent finishes)."""
-        body = _req_json(
-            f"{self.api_base}/api/follow_up", method="POST",
-            body={"agent": agent_id, "message": message}, timeout=self.timeout,
+        _require_ok(
+            _req_json(
+                f"{self.api_base}/api/follow_up", method="POST",
+                body={"agent": agent_id, "message": message}, timeout=self.timeout,
+            ),
+            "follow_up",
         )
-        if not body.get("ok"):
-            raise HiveError(f"follow_up failed: {body.get('error')}")
 
     def abort(self, agent_id: str, reason: Optional[str] = None) -> None:
         """Abort a running (or done/idle/aborted/failed) agent — no-op if terminal."""
         payload: Dict[str, Any] = {"agent": agent_id}
         if reason:
             payload["reason"] = reason
-        body = _req_json(
-            f"{self.api_base}/api/abort", method="POST", body=payload,
-            timeout=self.timeout,
+        _require_ok(
+            _req_json(
+                f"{self.api_base}/api/abort", method="POST", body=payload,
+                timeout=self.timeout,
+            ),
+            "abort",
         )
-        if not body.get("ok"):
-            raise HiveError(f"abort failed: {body.get('error')}")
 
     # -------------------------------------------------------- wait / completion
     def wait(self, agent_id: str, wait_time_ms: int = 0) -> Dict[str, Any]:
@@ -204,13 +229,14 @@ class HiveClient:
         `get_agent` — it blocks server-side up to `wait_time_ms` and is the
         ONLY sanctioned way to detect completion over HTTP.
         """
-        body = _req_json(
-            f"{self.api_base}/hive/agent/wait", method="POST",
-            body={"id": agent_id, "wait_time": int(wait_time_ms)},
-            timeout=self.timeout,
+        body = _require_ok(
+            _req_json(
+                f"{self.api_base}/hive/agent/wait", method="POST",
+                body={"id": agent_id, "wait_time": int(wait_time_ms)},
+                timeout=self.timeout,
+            ),
+            f"wait {agent_id}",
         )
-        if not body.get("ok"):
-            raise HiveError(f"wait {agent_id} failed: {body.get('error')}")
         return body
 
     def drive(
@@ -315,12 +341,13 @@ class HiveClient:
     def _final_texts(self, agent_id: str, since: int = 0) -> List[str]:
         """Assistant `message_end` texts from the event backlog, in order."""
         qs = urlencode({"since": since})
-        body = _req_json(
-            f"{self.api_base}/api/agent/{agent_id}/events?{qs}",
-            timeout=self.timeout,
+        body = _require_ok(
+            _req_json(
+                f"{self.api_base}/api/agent/{agent_id}/events?{qs}",
+                timeout=self.timeout,
+            ),
+            f"events {agent_id}",
         )
-        if not body.get("ok"):
-            return []
         texts: List[str] = []
         for ev in body.get("events", []):
             event: Dict[str, Any] = ev.get("event", {})
@@ -341,12 +368,13 @@ class HiveClient:
         ``complete:false`` = live fragment, never a final answer; rely on
         ``complete``, not ``status``. ``n`` is clamped server-side to [1,1024].
         """
-        body = _req_json(
-            f"{self.api_base}/hive/agent/glimpse", method="POST",
-            body={"id": agent_id, "n": int(n)}, timeout=self.timeout,
+        body = _require_ok(
+            _req_json(
+                f"{self.api_base}/hive/agent/glimpse", method="POST",
+                body={"id": agent_id, "n": int(n)}, timeout=self.timeout,
+            ),
+            f"glimpse {agent_id}",
         )
-        if not body.get("ok"):
-            raise HiveError(f"glimpse {agent_id} failed: {body.get('error')}")
         return body
 
     # Backward-compatible alias: the old name hits the same canonical endpoint.
@@ -358,11 +386,12 @@ class HiveClient:
         pending first, then recently-answered, bounded by store retention.
         Returns a copy list; the driver never writes here.
         """
-        body = _req_json(
-            f"{self.api_base}/api/agent/{agent_id}/questions", timeout=self.timeout,
+        body = _require_ok(
+            _req_json(
+                f"{self.api_base}/api/agent/{agent_id}/questions", timeout=self.timeout,
+            ),
+            f"questions {agent_id}",
         )
-        if not body.get("ok"):
-            raise HiveError(f"questions {agent_id} failed: {body.get('error')}")
         return body.get("questions", [])
 
 
@@ -446,35 +475,39 @@ def demo() -> None:
         port=args.port,
     )
 
-    if args.command == "drive":
-        result = client.drive(
-            prompt=args.prompt,
-            agent_id=args.id,
-            cwd=args.cwd,
-            wall_timeout=args.wall_timeout,
-        )
-        _emit(args, result)
-    elif args.command == "spawn":
-        _emit(args, client.spawn(cwd=args.cwd, agent=args.agent, model=args.model))
-    elif args.command == "prompt":
-        client.prompt(args.id, args.message)
-        _emit(args, {"ok": True, "id": args.id})
-    elif args.command == "steer":
-        client.steer(args.id, args.message)
-        _emit(args, {"ok": True, "id": args.id})
-    elif args.command == "abort":
-        client.abort(args.id, reason=args.reason)
-        _emit(args, {"ok": True, "id": args.id})
-    elif args.command == "wait":
-        _emit(args, client.wait(args.id, args.wait_time_ms))
-    elif args.command == "tree":
-        _emit(args, {"tree": client.get_tree()})
-    elif args.command == "agent":
-        _emit(args, client.get_agent(args.id))
-    elif args.command == "glimpse":
-        _emit(args, client.agent_glimpse(args.id, n=args.n))
-    elif args.command == "questions":
-        _emit(args, {"questions": client.questions(args.id)})
+    try:
+        if args.command == "drive":
+            result = client.drive(
+                prompt=args.prompt,
+                agent_id=args.id,
+                cwd=args.cwd,
+                wall_timeout=args.wall_timeout,
+            )
+            _emit(args, result)
+        elif args.command == "spawn":
+            _emit(args, client.spawn(cwd=args.cwd, agent=args.agent, model=args.model))
+        elif args.command == "prompt":
+            client.prompt(args.id, args.message)
+            _emit(args, {"ok": True, "id": args.id})
+        elif args.command == "steer":
+            client.steer(args.id, args.message)
+            _emit(args, {"ok": True, "id": args.id})
+        elif args.command == "abort":
+            client.abort(args.id, reason=args.reason)
+            _emit(args, {"ok": True, "id": args.id})
+        elif args.command == "wait":
+            _emit(args, client.wait(args.id, args.wait_time_ms))
+        elif args.command == "tree":
+            _emit(args, {"tree": client.get_tree()})
+        elif args.command == "agent":
+            _emit(args, client.get_agent(args.id))
+        elif args.command == "glimpse":
+            _emit(args, client.agent_glimpse(args.id, n=args.n))
+        elif args.command == "questions":
+            _emit(args, {"questions": client.questions(args.id)})
+    except HiveError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 def _emit(args: Any, payload: Dict[str, Any]) -> None:
